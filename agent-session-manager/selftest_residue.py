@@ -648,6 +648,37 @@ def main() -> int:
     print("=" * 74)
     print(f"沙箱: {_SANDBOX}")
 
+    # The sandbox is removed in a `finally`: a suite that crashes part-way
+    # through must not leak a temp directory. Leaving one behind on an
+    # assertion failure would be the exact class of mess this tool exists to
+    # eliminate -- and it happened for real while this suite was being written.
+    try:
+        _run_tests()
+    finally:
+        # Always clean up, including on a crash. Set ASM_KEEP_SANDBOX=1 when
+        # you deliberately want to inspect the leftover state.
+        if os.environ.get("ASM_KEEP_SANDBOX") == "1":
+            print(f"[keep] 沙箱保留以供检查: {_SANDBOX}")
+        else:
+            err = remove_tree(_SANDBOX)
+            if err:
+                print(f"警告：沙箱清理失败 {err}", file=sys.stderr)
+                FAILURES.append("sandbox cleanup failed")
+            else:
+                print("沙箱已清理。")
+
+    print("\n" + "=" * 74)
+    if FAILURES:
+        print(f"RESULT: {len(FAILURES)} 项失败")
+        for f in FAILURES:
+            print(f"  - {f}")
+    else:
+        print("RESULT: 全部通过")
+    print("=" * 74)
+    return 1 if FAILURES else 0
+
+
+def _run_tests() -> None:
     fx = build_fixtures()
     test_source_repo_protection(fx)
     test_shared_protection()
@@ -663,24 +694,6 @@ def main() -> int:
     test_shortcut_cleanup(fx)
     test_cleanup_accounting()
     test_batch_delete_preview()
-
-    print("\n" + "=" * 74)
-    if FAILURES:
-        print(f"RESULT: {len(FAILURES)} 项失败")
-        for f in FAILURES:
-            print(f"  - {f}")
-    else:
-        print("RESULT: 全部通过")
-    print("=" * 74)
-
-    # Leave no sandbox behind -- residual temp directories are exactly the class
-    # of mess this tool exists to eliminate.
-    err = remove_tree(_SANDBOX)
-    if err:
-        print(f"警告：沙箱清理失败 {err}", file=sys.stderr)
-        return 1
-    print("沙箱已清理。")
-    return 1 if FAILURES else 0
 
 
 if __name__ == "__main__":

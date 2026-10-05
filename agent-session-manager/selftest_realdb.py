@@ -226,7 +226,12 @@ def main() -> int:
         test_workbuddy(work)
         test_copilot(work)
     finally:
-        if not FAILURES:
+        # Always clean up: a failing run must not leave a sandbox behind, which
+        # is the class of mess this tool exists to remove. Set
+        # ASM_KEEP_SANDBOX=1 when you deliberately want to inspect the state.
+        if os.environ.get("ASM_KEEP_SANDBOX") == "1":
+            print(f"[keep] sandbox retained for inspection: {work}")
+        else:
             err = remove_tree(work)
             if err:
                 print(f"[warn] could not remove sandbox {work}: {err}")

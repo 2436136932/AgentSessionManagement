@@ -356,6 +356,8 @@ python run_all_tests.py
 
 删除类测试在导入任何适配器**之前**就把 `USERPROFILE`/`APPDATA`/`LOCALAPPDATA` 指向临时沙箱，因此**不可能**碰到真实会话。`selftest_realdb.py` 只**读取**真实数据库并写入副本，且逐表比对往返前后每一行必须完全一致。
 
+沙箱清理一律放在 `finally` 中：**测试崩溃也不留临时目录**。需要检查失败现场时设 `ASM_KEEP_SANDBOX=1` 保留沙箱。这条规则是被真实缺陷逼出来的——`selftest_residue.py` 曾在中途抛异常时泄漏沙箱（本机实测残留 7 个）。
+
 关键断言包括：
 - 删除后重扫 → **无幽灵、无孤儿**
 - 删除共享附件所引用的会话后 → **其他会话的附件仍在**
@@ -407,6 +409,7 @@ python run_all_tests.py
 | 共享容器规则按任意路径段匹配 | `%APPDATA%\Microsoft\Windows\Start Menu\...` 含 "Microsoft" 和 "Windows" → **所有开始菜单快捷方式都被判 `never`**，永远清不掉 | `core/ownership.py`（`_shared_hit` 只看驱动符下前两层，`C:\Program Files`/`C:\Windows` 等仍然拦住） |
 | 批量删除没有预演 | 批量是最危险的操作，却从"勾选"直接到"删除"，看不到哪些项会被安全检查拒绝 | `server.py` `/api/batch-delete` 支持 `dry_run`，前端确认框先展示预演结果 |
 | **`/api/quarantine/purge` 忽略 `dry_run`** | 接口收了 `dry_run` 参数却**照样真的清空隔离区** —— 请求预演的调用方会丢掉自己的撤销缓冲。核心层测试抓不到这类缺陷（它们不经过 HTTP），为此新增 `selftest_api.py` | `server.py`（预演走 `plan_purge`）+ 新增 HTTP 契约测试套件 |
+| 沙箱在测试崩溃时泄漏 | `selftest_residue.py` 只在 `main()` 末尾清理，中途抛异常就留下临时目录；`selftest_realdb.py` 更是**仅在全部通过时**才清理。本机实测残留 7 个沙箱 | 两个套件（清理移入 `finally`，`ASM_KEEP_SANDBOX=1` 可保留现场） |
 
 ---
 
