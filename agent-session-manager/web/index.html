@@ -34,6 +34,15 @@
   .card h3{margin:0 0 4px;font-size:15px;display:flex;align-items:center;gap:8px}
   .card .path{color:var(--muted);font-size:12px;font-family:ui-monospace,Consolas,monospace;
     word-break:break-all;margin:6px 0}
+  /* Full storage paths: shown in full (not abbreviated) and selectable, because
+     a user who wants the real path usually wants to paste it somewhere. */
+  .prow{display:flex;align-items:flex-start;gap:6px}
+  .prow .p{flex:1;min-width:0;word-break:break-all;user-select:all;cursor:text}
+  .copybtn{flex:none;font-size:11px;padding:1px 6px;border-radius:5px;cursor:pointer;
+    border:1px solid var(--line);background:transparent;color:var(--muted);
+    font-family:inherit;line-height:1.5}
+  .copybtn:hover{color:var(--fg);border-color:var(--muted)}
+  .copybtn.done{color:var(--ok);border-color:var(--ok)}
   .stat{display:flex;gap:16px;margin-top:10px;flex-wrap:wrap}
   .stat div{font-size:12px;color:var(--muted)}
   .stat b{display:block;font-size:17px;color:var(--fg);font-weight:600}
@@ -218,6 +227,39 @@ document.querySelectorAll("nav button").forEach(b => {
 });
 
 /* --------------------------------------------------------------- overview */
+/* Copy an agent's real storage paths. The full paths are already in the report
+   payload (existing_roots), so nothing is recomputed here. Clipboard access on
+   http://127.0.0.1 is a secure context, but the API can still be absent, so a
+   fallback selection keeps the path reachable by hand. */
+window.copyAgentPaths = async (agentId, btn) => {
+  const a = (STATE.report && STATE.report.agents || []).find(x => x.id === agentId);
+  if(!a) return;
+  const roots = (a.existing_roots && a.existing_roots.length) ? a.existing_roots : (a.roots || []);
+  const text = roots.join("\n");
+  if(!text) return;
+  let ok = false;
+  try {
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      await navigator.clipboard.writeText(text);
+      ok = true;
+    }
+  } catch(e){ ok = false; }
+  if(!ok){
+    // Fallback: select the text so the user can press Ctrl+C.
+    try {
+      const row = btn.closest(".path");
+      const rng = document.createRange();
+      rng.selectNodeContents(row);
+      const sel = window.getSelection();
+      sel.removeAllRanges(); sel.addRange(rng);
+    } catch(e){ /* nothing more we can do */ }
+  }
+  const old = btn.textContent;
+  btn.textContent = ok ? "已复制" : "请按 Ctrl+C";
+  btn.classList.add("done");
+  setTimeout(()=>{ btn.textContent = old; btn.classList.remove("done"); }, 1600);
+};
+
 async function loadOverview(){
   $("#view-overview").innerHTML = `<div class="empty"><span class="spin"></span> 正在扫描本机 Agent…</div>`;
   const r = await api("/api/report");
@@ -235,7 +277,18 @@ async function loadOverview(){
         <span class="badge ${installed?'ok':''}">${installed?'已安装':'未检测到'}</span>
         ${a.running.length?`<span class="badge warn">运行中</span>`:''}
       </h3>
-      <div class="path">${esc(a.storage_hint)}</div>
+      <div class="path" title="存储位置（缩写）：${esc(a.storage_hint)}">${
+        (a.existing_roots && a.existing_roots.length)
+          ? a.existing_roots.map((p,i)=>`<div class="prow">
+              <span class="p" title="${esc(p)}">${esc(p)}</span>
+              ${i===0?`<button class="copybtn" onclick="copyAgentPaths(${jsq(a.id)}, this)"
+                title="复制${a.existing_roots.length>1?"全部":""}路径">复制</button>`:""}
+            </div>`).join("")
+          : (a.roots && a.roots.length)
+            ? a.roots.map(p=>`<div class="prow"><span class="p" title="${esc(p)}">${esc(p)}</span></div>`).join("")
+              + `<div style="margin-top:4px">（该目录当前不存在）</div>`
+            : `<span>${esc(a.storage_hint)}</span>`
+      }</div>
       <div class="stat">
         <div><b>${a.session_count ?? 0}</b>会话</div>
         <div><b>${hsize(a.size)}</b>占用空间</div>
