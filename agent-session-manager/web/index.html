@@ -1363,11 +1363,63 @@ function drawPreflight(){
       <button class="act" onclick="gotoVerify()">下一步：卸载后验证</button>
       <button class="act" onclick="gotoPlan()" ${U.pf.installed?'':'disabled'}>查看清理方案</button>
     </div>
+    ${u.found ? `<div class="card" style="margin-top:12px">
+      <b>调用官方卸载器</b>
+      <div class="sub">这是整个流程里<b>唯一不可逆</b>的一步：它会真正卸载该程序，
+        本工具无法撤销卸载本身（但卸载后剩下的残留仍可清理，且每项都会先备份）。</div>
+      ${u.command?`<div class="mono" style="font-size:12px;word-break:break-all;margin:8px 0">${esc(u.command)}</div>`:""}
+      <label class="chk"><input type="checkbox" id="uUninstOk">
+        我确认要调用官方卸载器${u.silent?"（静默模式，不会弹窗）":"（会弹出图形界面，需手动完成）"}</label>
+      <div class="row" style="margin-top:8px">
+        <button class="act" id="uUninstGo" onclick="runUninstaller()"
+          ${pf.can_proceed?'':'disabled'}>执行卸载</button>
+        ${pf.can_proceed?'':'<span class="sub">预检未通过，请先处理上方阻碍项</span>'}
+      </div>
+      <div id="uUninstRun"></div>
+    </div>` : `<div class="card" style="margin-top:12px">
+      <b>未找到官方卸载器</b>
+      <div class="sub">注册表中没有该产品的卸载条目，请从「设置 → 应用」中卸载，
+        或直接用下面的清理方案处理残留。</div>
+    </div>`}
     <div id="uAdmin"></div>
     <div id="uNext"></div>`;
   box.innerHTML = h;
   loadAdminPlan();
 }
+
+window.runUninstaller = async () => {
+  const box = $("#uUninstRun");
+  const chk = $("#uUninstOk");
+  if(!chk || !chk.checked){
+    box.innerHTML = `<div class="warnbox">请先勾选上方确认框。</div>`;
+    return;
+  }
+  if(!confirm("将调用官方卸载器，此操作不可撤销。确定继续？")) return;
+  const btn = $("#uUninstGo");
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spin"></span> 正在调用卸载器…`;
+  let r;
+  try {
+    r = await api("/api/uninstall/run", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({agent: U.agent, confirm: true})
+    });
+  } catch(e){ r = {ok:false, error:e.message}; }
+
+  if(!r.ok){
+    box.innerHTML = `<div class="errbox"><b>卸载器未能完成</b><br>${esc(r.error||"")}</div>`;
+    btn.disabled = false; btn.textContent = "重试";
+    return;
+  }
+  box.innerHTML = `<div class="okbox">${esc(r.note||"卸载器已执行完毕。")}</div>
+    ${r.exit_code != null ? `<div class="sub">退出码：${esc(String(r.exit_code))}</div>` : ""}
+    ${r.stderr ? `<pre class="mono" style="max-height:160px;overflow:auto;font-size:11.5px">${esc(r.stderr)}</pre>` : ""}
+    <div class="row" style="margin-top:10px">
+      <button class="act" onclick="gotoVerify()">下一步：卸载后验证</button>
+      <button class="act ghostbtn" onclick="openUninstall(${jsq(U.agent)})">重新预检</button>
+    </div>`;
+  btn.textContent = "已执行";
+};
 
 /* ------------------------------------------- privileged (needs admin) --- */
 /* Some residue cannot be removed by a normal user: HKLM keys, firewall rules,
