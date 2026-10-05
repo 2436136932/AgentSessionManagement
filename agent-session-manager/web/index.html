@@ -165,6 +165,17 @@
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+/* A value safe to embed as a JavaScript *string literal* inside a
+   double-quoted HTML attribute.
+   esc() alone is not enough there: it turns ' into &#39;, and the HTML parser
+   decodes entities BEFORE the JavaScript in the attribute is parsed, so
+   onclick="f('a&#39;b')" reaches the JS engine as f('a'b') -- a syntax error.
+   The button then looks fine but silently does nothing. A session id is
+   attacker-influenced data (it is a directory name), so this must be airtight:
+   JSON.stringify handles quoting/backslashes, then entity-encode for HTML. */
+const jsq = s => JSON.stringify(String(s ?? ""))
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+  .replace(/"/g,'&quot;');
 const hsize = n => {
   if(!n) return "0 B";
   const u=["B","KB","MB","GB","TB"]; let i=0;
@@ -226,7 +237,7 @@ async function loadOverview(){
         <div><b>${a.file_count.toLocaleString()}</b>文件</div>
       </div>
       ${installed?`<div style="margin-top:12px">
-        <button class="act ghostbtn" onclick="showSessionsFor('${esc(a.id)}')">查看会话</button>
+        <button class="act ghostbtn" onclick="showSessionsFor(${jsq(a.id)})">查看会话</button>
       </div>`:`<div class="path" style="margin-top:10px">未在本机发现该 Agent 的数据目录。</div>`}
     </div>`;
   }
@@ -397,19 +408,19 @@ function rowHtml(s){
     <td><input type="checkbox" class="pick" data-agent="${ea}" data-sid="${eid}"></td>
     <td class="mono">${esc(s.agent)}</td>
     <td><div class="title clickable" title="点击预览会话内容：${esc(s.title)}"
-          onclick="previewSession('${ea}','${eid}')">${esc(s.title)}</div>
+          onclick="previewSession(${jsq(ea)},${jsq(eid)})">${esc(s.title)}</div>
         ${tags.join("")}${s.note?`<div class="path" style="margin:2px 0 0">${esc(s.note)}</div>`:''}</td>
     <td class="mono" style="font-size:11px">${esc(s.sid)}</td>
     <td class="num">${tierCell(s)}</td>
     <td class="num">${hsize(s.size)}</td>
     <td class="mono" style="font-size:11.5px">${esc(s.updated_iso||'')}</td>
     <td style="white-space:nowrap">
-      <button class="act ghostbtn" onclick="previewSession('${ea}','${eid}')">查看</button>
+      <button class="act ghostbtn" onclick="previewSession(${jsq(ea)},${jsq(eid)})">查看</button>
       <button class="act ghostbtn" title="${esc(lockTitle)}"
-        onclick="togglePin('${ea}','${eid}')">${esc(lockLabel)}</button>
+        onclick="togglePin(${jsq(ea)},${jsq(eid)})">${esc(lockLabel)}</button>
       <button class="act ghostbtn" title="导出会话内容到文件"
-        onclick="exportSession('${ea}','${eid}')">导出</button>
-      <button class="act" onclick="planDelete('${ea}','${eid}')">删除…</button>
+        onclick="exportSession(${jsq(ea)},${jsq(eid)})">导出</button>
+      <button class="act" onclick="planDelete(${jsq(ea)},${jsq(eid)})">删除…</button>
     </td>
   </tr>`;
 }
@@ -474,7 +485,7 @@ window.exportSession = async (agent, sid) => {
       JSON（完整结构化数据，便于再处理）</label>
     <div class="row">
       <button class="act ghostbtn" onclick="closeModal()">取消</button>
-      <button class="act" id="expGo" onclick="runExport('${esc(agent)}','${esc(sid)}')">导出</button>
+      <button class="act" id="expGo" onclick="runExport(${jsq(agent)},${jsq(sid)})">导出</button>
     </div>`);
 };
 
@@ -591,9 +602,9 @@ function renderPreview(agent, sid, r){
 
   h += `<div class="row">
     <button class="act ghostbtn" onclick="closeModal()">关闭</button>
-    <button class="act ghostbtn" onclick="closeModal();exportSession('${esc(agent)}','${esc(sid)}')">
+    <button class="act ghostbtn" onclick="closeModal();exportSession(${jsq(agent)},${jsq(sid)})">
       导出…</button>
-    <button class="act" onclick="closeModal();planDelete('${esc(agent)}','${esc(sid)}')">
+    <button class="act" onclick="closeModal();planDelete(${jsq(agent)},${jsq(sid)})">
       删除这个会话…</button>
   </div>`;
 
@@ -708,7 +719,7 @@ window.doDelete = async (agent, sid, fingerprint) => {
       <div class="errbox">${esc(r.error||'')}<br><br>${esc(r.detail||'')}</div>
       <div class="row">
         <button class="act ghostbtn" onclick="closeModal()">关闭</button>
-        ${stale?`<button class="act" onclick="closeModal();planDelete('${esc(agent)}','${esc(sid)}')">
+        ${stale?`<button class="act" onclick="closeModal();planDelete(${jsq(agent)},${jsq(sid)})">
           重新查看计划</button>`:''}
       </div>`);
   } else {
@@ -898,7 +909,7 @@ async function runSearch(){
     if(res.pinned) tags.push(`<span class="tag" style="color:var(--warn);border-color:#5c4620">保留</span>`);
     h += `<div class="card" style="margin-bottom:12px">
       <h3 style="font-size:14px;cursor:pointer"
-          onclick="previewSession('${esc(res.agent)}','${esc(res.sid)}')">
+          onclick="previewSession(${jsq(res.agent)},${jsq(res.sid)})">
         ${esc(res.title||'(无标题)')}
         <span class="badge">${res.match_count} 处</span>${tags.join("")}</h3>
       <div class="path">${esc(res.agent_label)} · <span class="mono">${esc(res.sid)}</span>
@@ -913,10 +924,10 @@ async function runSearch(){
     }
     h += `</div>
       <div style="margin-top:8px">
-        <button class="act ghostbtn" onclick="previewSession('${esc(res.agent)}','${esc(res.sid)}')">查看会话</button>
-        <button class="act ghostbtn" onclick="togglePin('${esc(res.agent)}','${esc(res.sid)}')">
+        <button class="act ghostbtn" onclick="previewSession(${jsq(res.agent)},${jsq(res.sid)})">查看会话</button>
+        <button class="act ghostbtn" onclick="togglePin(${jsq(res.agent)},${jsq(res.sid)})">
           ${res.pinned?'取消保留':'标记保留'}</button>
-        <button class="act" onclick="planDelete('${esc(res.agent)}','${esc(res.sid)}')">删除…</button>
+        <button class="act" onclick="planDelete(${jsq(res.agent)},${jsq(res.sid)})">删除…</button>
       </div></div>`;
   }
   $("#sResults").innerHTML = h;
@@ -970,14 +981,14 @@ async function renderUsage(){
     if(!d.available) continue;
     h += `<tr>
       <td class="mono">${esc(d.agent)}</td>
-      <td><div class="title clickable" onclick="previewSession('${esc(d.agent)}','${esc(d.sid)}')">
+      <td><div class="title clickable" onclick="previewSession(${jsq(d.agent)},${jsq(d.sid)})">
           ${esc(d.title||'(无标题)')}</div></td>
       <td class="num">${n(d.tokens.input)}</td><td class="num">${n(d.tokens.output)}</td>
       <td class="num"><b>${n(d.tokens.total)}</b></td>
       <td class="num">${d.cost!=null?d.cost:'—'}</td>
       <td class="num">${d.turns??'—'}</td>
-      <td><button class="act ghostbtn" onclick="previewSession('${esc(d.agent)}','${esc(d.sid)}')">查看</button>
-          <button class="act" onclick="planDelete('${esc(d.agent)}','${esc(d.sid)}')">删除…</button></td></tr>`;
+      <td><button class="act ghostbtn" onclick="previewSession(${jsq(d.agent)},${jsq(d.sid)})">查看</button>
+          <button class="act" onclick="planDelete(${jsq(d.agent)},${jsq(d.sid)})">删除…</button></td></tr>`;
   }
   h += `</tbody></table></div>`;
   $("#view-usage").innerHTML = h;
@@ -1033,7 +1044,7 @@ async function renderCleanup(){
         <td><input type="checkbox" class="rtPick" data-agent="${esc(p.agent)}"
              data-sid="${esc(p.sid)}"></td>
         <td class="mono">${esc(p.agent)}</td>
-        <td><div class="title clickable" onclick="previewSession('${esc(p.agent)}','${esc(p.sid)}')">
+        <td><div class="title clickable" onclick="previewSession(${jsq(p.agent)},${jsq(p.sid)})">
             ${esc(p.title||'(无标题)')}</div>
           ${p.is_ghost?'<span class="tag ghost">幽灵</span>':''}
           ${p.is_orphan?'<span class="tag orphan">孤儿</span>':''}</td>
@@ -1041,8 +1052,8 @@ async function renderCleanup(){
         <td class="mono" style="font-size:11.5px">${esc(p.updated_iso||'')}</td>
         <td style="font-size:11.5px;color:var(--muted)">${p.reasons.map(esc).join('<br>')}</td>
         <td style="white-space:nowrap">
-          <button class="act ghostbtn" onclick="previewSession('${esc(p.agent)}','${esc(p.sid)}')">查看</button>
-          <button class="act" onclick="planDelete('${esc(p.agent)}','${esc(p.sid)}')">删除…</button></td>
+          <button class="act ghostbtn" onclick="previewSession(${jsq(p.agent)},${jsq(p.sid)})">查看</button>
+          <button class="act" onclick="planDelete(${jsq(p.agent)},${jsq(p.sid)})">删除…</button></td>
       </tr>`;
     }
     h += `</tbody></table></div>
@@ -1164,7 +1175,7 @@ window.renderUninstall = async () => {
       <td class="num" style="color:var(--warn)">${esc(a.review_bytes_h)}</td>
       <td class="num" style="color:var(--muted)">${esc(a.never_bytes_h)}</td>
       <td class="num">${a.credentials?`<b style="color:var(--warn)">${a.credentials}</b>`:'0'}</td>
-      <td><button class="act" onclick="openUninstall('${esc(a.agent)}')">查看残留</button></td>
+      <td><button class="act" onclick="openUninstall(${jsq(a.agent)})">查看残留</button></td>
     </tr>`;
   }
   h += `</tbody></table>
@@ -1241,11 +1252,12 @@ function drawPreflight(){
       `</table></div>`;
   }
   if((pf.temp||[]).length){
-    h += `<div class="sub" style="margin:8px 0">%TEMP% 临时目录 ${pf.temp.length} 个，共 ${esc((pf.temp||[]).reduce((n,t)=>n+(t.size||0),0)>0?"":"0 B")}</div>`;
+    const tmpBytes = pf.temp.reduce((n,t)=>n+(t.size||0),0);
+    h += `<div class="sub" style="margin:8px 0">%TEMP% 临时目录 ${pf.temp.length} 个，共 ${esc(hsize(tmpBytes))}</div>`;
   }
 
   h += `<div class="row" style="margin-top:12px">
-      <button class="act ghostbtn" onclick="openUninstall('${esc(U.agent)}')">重新预检</button>
+      <button class="act ghostbtn" onclick="openUninstall(${jsq(U.agent)})">重新预检</button>
       <button class="act" onclick="gotoVerify()">下一步：卸载后验证</button>
       <button class="act" onclick="gotoPlan()" ${U.pf.installed?'':'disabled'}>查看清理方案</button>
     </div>
@@ -1277,7 +1289,7 @@ window.gotoVerify = async () => {
     </table></div>
     <div class="row" style="margin-top:10px">
       <button class="act" onclick="gotoPlan()">下一步：清理残留</button>
-      <button class="act ghostbtn" onclick="openUninstall('${esc(U.agent)}')">返回预检</button>
+      <button class="act ghostbtn" onclick="openUninstall(${jsq(U.agent)})">返回预检</button>
     </div>`;
 };
 
@@ -1396,7 +1408,7 @@ async function renderHistory(){
       <td>${st}</td>
       <td class="num">${esc(o.quarantine_size_h)}</td>
       <td>${o.restorable
-        ? `<button class="act" onclick="doRestore('${esc(o.op_id)}')">还原</button>`
+        ? `<button class="act" onclick="doRestore(${jsq(o.op_id)})">还原</button>`
         : `<span class="badge">已清理</span>`}</td>
     </tr>`;
   }

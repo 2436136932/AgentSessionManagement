@@ -134,6 +134,15 @@ def pinned_map() -> dict[str, dict]:
 
 
 def set_tags(agent: str, sid: str, tags: list[str]) -> list[str]:
+    """Replace this session's tags.
+
+    A bare string is rejected rather than iterated: `set_tags(..., "hello")`
+    would otherwise silently store one tag per character
+    (`['h','e','l','l','o']`), which is exactly the kind of quiet corruption
+    that is hard to notice and annoying to undo.
+    """
+    if isinstance(tags, str) or not isinstance(tags, (list, tuple, set)):
+        tags = []
     clean = sorted({str(t).strip() for t in tags if str(t).strip()})[:20]
     with _LOCK:
         d = load()

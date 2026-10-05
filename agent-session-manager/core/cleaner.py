@@ -248,13 +248,12 @@ def protection(agent_id: str, adapter=None) -> dict:
             }
         )
 
-    # Pinned sessions: a pin is an explicit "do not touch".
+    # Workspace pins: a pin is an explicit "do not touch", and it outranks the
+    # convenience of a bulk cleanup.
     try:
         from core import store
 
-        counts = store.counts()
-        pin_info = store.workspace_pins()
-        mine = [w for w in pin_info if w.get("agent") == agent_id]
+        mine = [w for w in store.workspace_pins() if w.get("agent") == agent_id]
         if mine:
             blockers.append(
                 {
@@ -266,7 +265,6 @@ def protection(agent_id: str, adapter=None) -> dict:
                     "items": [w.get("path", "") for w in mine],
                 }
             )
-        del counts
     except Exception:
         pass
     return {"blockers": blockers, "can_proceed": not blockers}

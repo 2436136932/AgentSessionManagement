@@ -568,8 +568,13 @@ class Handler(BaseHTTPRequestHandler):
             agent, sid = body.get("agent", ""), body.get("sid", "")
             if not agent or not sid:
                 return self.error_out("缺少 agent 或 sid")
+            raw_tags = body.get("tags")
+            # A bare string would be iterated character by character and stored
+            # as one tag per letter. Reject it instead of silently mangling it.
+            if raw_tags is not None and not isinstance(raw_tags, list):
+                return self.error_out("tags 必须是数组")
             try:
-                tags = store.set_tags(agent, sid, body.get("tags") or [])
+                tags = store.set_tags(agent, sid, raw_tags or [])
                 return self.json_out({"ok": True, "tags": tags, **store.counts()})
             except Exception as e:
                 return self.error_out("设置标签失败", 500, str(e))
@@ -610,9 +615,17 @@ class Handler(BaseHTTPRequestHandler):
         # ---- residue cleanup -------------------------------------------------
         # /api/cleanup  { agent, paths?, dispositions?, permanent?, dry_run? }
         if path == "/api/cleanup":
+            from adapters.registry import get_adapter
+
             agent = body.get("agent", "")
             if not agent:
                 return self.error_out("缺少 agent")
+            # The agent must be one this tool actually knows. Without this, any
+            # string could be used as an authority to classify and remove real
+            # paths: ownership would still refuse `never` items, but an unknown
+            # id should never get as far as proposing a removal at all.
+            if get_adapter(agent) is None:
+                return self.error_out(f"未知的 Agent：{agent}", 404)
             paths = body.get("paths")
             if paths is not None and not isinstance(paths, list):
                 return self.error_out("paths 必须是数组")
