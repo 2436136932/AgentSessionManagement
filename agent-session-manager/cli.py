@@ -622,6 +622,125 @@ def cmd_projects(args) -> int:
     return EXIT_OK
 
 
+def cmd_admin(args) -> int:
+    """Do the handful of things that genuinely need Administrator."""
+    from core import elevate
+
+    p = elevate.plan(args.agent)
+    if not p["actions"]:
+        print("本机没有需要管理员权限的残留项。")
+        return EXIT_OK
+
+    print(f"=== {args.agent} 需要管理员权限的项目：{p['count']} 项 ===")
+    for i, a in enumerate(p["actions"], 1):
+        print("  %d. %-12s %s" % (i, a["kind"], a["target"]))
+        print("     %s" % a["reason"])
+    print()
+    if p["already_elevated"]:
+        print("当前已是管理员权限，无需提权；请直接用 `cleanup` 清理即可。")
+        return EXIT_OK
+
+    if args.show_script:
+        print("--- 将以管理员身份运行的 PowerShell 脚本 ---")
+        print(p["script"])
+        print("--- 脚本结束 ---")
+        return EXIT_OK
+
+    if not args.yes:
+        print("这是预检结果。要真正执行并弹出 UAC 授权窗口，请加 --yes。")
+        print("提示：加 --show-script 可先查看将要运行的完整脚本。")
+        print("注意：每项在删除前都会把备份写入隔离区；取消 UAC 不会修改任何东西。")
+        return EXIT_OK
+
+    only = args.only or None
+    # Validate the narrowing *before* announcing a UAC prompt: a target outside
+    # the agent's inventory must fail visibly, not after looking like it started.
+    if only:
+        allowed = {a["target"] for a in p["actions"]}
+        rejected = [t for t in only if t not in allowed]
+        if rejected:
+            print("拒绝执行：以下目标不在该 Agent 的可提权清单中：", file=sys.stderr)
+            for t in rejected:
+                print("  - %s" % t, file=sys.stderr)
+            print("可提权的目标只有：", file=sys.stderr)
+            for a in p["actions"]:
+                print("  - %s" % a["target"], file=sys.stderr)
+            return EXIT_REFUSED
+
+    print("正在请求管理员权限（请在 UAC 窗口中确认）…")
+    r = elevate.execute(args.agent, confirm=True, only=only)
+
+    if args.json:
+        emit(args, r)
+    else:
+        if r.get("cancelled"):
+            print("已取消：你拒绝了 UAC 授权，未做任何修改。")
+            return EXIT_REFUSED
+        if not r.get("elevated"):
+            print("未能提权：%s" % (r.get("error") or "未知原因"), file=sys.stderr)
+            return EXIT_ERROR
+        ok = [x for x in r.get("results", []) if x.get("ok")]
+        bad = [x for x in r.get("results", []) if not x.get("ok")]
+        print("成功 %d 项，失败 %d 项。" % (len(ok), len(bad)))
+        for x in r.get("results", []):
+            mark = "✓" if x.get("ok") else "✗"
+            note = x.get("error") or x.get("note") or ""
+            print("  %s [%s] %s  %s" % (mark, x.get("kind"), str(x.get("target"))[:60], note))
+        if r.get("backup_dir"):
+            print("\n备份位置：%s" % r["backup_dir"])
+            print("注册表可用 reg import 还原；快捷方式可直接复制回去。")
+    return EXIT_OK if r.get("ok") else EXIT_ERROR
+
+
+def cmd_capabilities(args) -> int:
+    """What this tool can and cannot clean, and why. Read-only.
+
+    Exists because "did it uninstall completely?" deserves a straight answer
+    rather than a green checkmark.
+    """
+    from core import elevate, uninstall
+
+    env = __import__("core.wininteg", fromlist=["x"]).environment_summary()
+    r = uninstall.full_report()
+    if args.json:
+        emit(args, {"elevated": env["elevated"], "agents": r["agents"],
+                    "privileged": {a["agent"]: elevate.plan(a["agent"])["count"]
+                                   for a in r["agents"]}})
+        return EXIT_OK
+
+    print("=== 清理能力与边界 ===")
+    print("  当前权限: %s" % ("管理员" if env["elevated"] else "普通用户（部分项目需提权）"))
+    print()
+    print("  %-16s %-12s %-12s %s" % ("Agent", "可安全清理", "需人工确认", "需管理员"))
+    for a in r["agents"]:
+        n = elevate.plan(a["agent"])["count"]
+        print("  %-16s %-12s %-12s %d"
+              % (a["agent"], a.get("reclaimable_bytes_h", "—"),
+                 a.get("review_bytes_h", "—"), n))
+    print()
+    print("本工具会清理：")
+    for line in (
+        "会话记录（按适配器分别处理文件 / SQLite 行 / 索引条目）",
+        "可再生缓存、日志、临时目录、空壳目录",
+        "密钥/凭据文件（单独列出，默认不勾选）",
+        "HKCU 注册表厂商键（删除前导出 .reg 备份）",
+        "开始菜单 / 桌面快捷方式（移入隔离区，可还原）",
+        "防火墙规则、HKLM 注册表键、ProgramData 快捷方式（需提权，见 admin-cleanup）",
+    ):
+        print("  · " + line)
+    print()
+    print("本工具不清理（以及原因）：")
+    for line in (
+        "程序安装目录 —— 交给官方卸载器，手工删会留下更多注册表残渣",
+        "凭据管理器（cmdkey）—— 尚未实现扫描",
+        "环境变量 PATH 条目 —— 尚未实现扫描",
+        "App Paths / 文件关联 / 协议处理器 —— 尚未实现扫描",
+        "系统服务与计划任务 —— 只报告，删除可能影响系统，需人工判断",
+    ):
+        print("  · " + line)
+    return EXIT_OK
+
+
 def cmd_report(args) -> int:
     from core import uninstall
 
@@ -756,6 +875,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("projects", help="按项目聚合会话")
     p.add_argument("--limit", type=int, default=20)
     p.set_defaults(func=cmd_projects)
+
+    p = sub.add_parser("admin-cleanup",
+                       help="以管理员身份完成需要提权的残留清理（会弹 UAC）")
+    p.add_argument("--agent", required=True)
+    p.add_argument("--yes", action="store_true", help="确认执行并弹出 UAC 授权")
+    p.add_argument("--show-script", action="store_true",
+                   help="只打印将要以管理员身份运行的完整脚本")
+    p.add_argument("--only", nargs="*", default=None,
+                   help="只处理指定目标（不能超出该 Agent 的清单）")
+    p.set_defaults(func=cmd_admin)
+
+    p = sub.add_parser("capabilities",
+                       help="本工具能清理什么、不能清理什么（只读）")
+    p.set_defaults(func=cmd_capabilities)
 
     p = sub.add_parser("report", help="各 Agent 卸载/回收概览")
     p.set_defaults(func=cmd_report)

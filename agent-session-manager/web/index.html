@@ -1247,7 +1247,7 @@ window.runRetentionBatch = async () => {
 };
 
 /* ------------------------------------------------- uninstall / clean-up */
-const U = { agent:"", pf:null, plan:null, stage:1 };
+const U = { agent:"", pf:null, plan:null, stage:1, adminPlan:null };
 
 window.renderUninstall = async () => {
   $("#view-uninstall").innerHTML = `<div class="empty"><span class="spin"></span> 正在读取各 Agent 残留…</div>`;
@@ -1363,9 +1363,114 @@ function drawPreflight(){
       <button class="act" onclick="gotoVerify()">下一步：卸载后验证</button>
       <button class="act" onclick="gotoPlan()" ${U.pf.installed?'':'disabled'}>查看清理方案</button>
     </div>
+    <div id="uAdmin"></div>
     <div id="uNext"></div>`;
   box.innerHTML = h;
+  loadAdminPlan();
 }
+
+/* ------------------------------------------- privileged (needs admin) --- */
+/* Some residue cannot be removed by a normal user: HKLM keys, firewall rules,
+   ProgramData shortcuts. This panel lists them, shows the exact PowerShell that
+   would run, and -- only on an explicit confirmation -- raises a single UAC
+   prompt. Nothing here runs without that click. */
+window.loadAdminPlan = async () => {
+  const box = $("#uAdmin");
+  if(!box) return;
+  let p;
+  try { p = await api("/api/uninstall/admin-plan?agent=" + encodeURIComponent(U.agent)); }
+  catch(e){ box.innerHTML = `<div class="errbox">读取提权清单失败：${esc(e.message)}</div>`; return; }
+  if(!p.ok){ box.innerHTML = `<div class="errbox">${esc(p.error||"")}</div>`; return; }
+
+  if(!p.count){
+    box.innerHTML = `<div class="card" style="margin-top:12px">
+      <b>无需管理员权限</b>
+      <div class="sub">该 Agent 的残留都可以用当前权限清理。</div></div>`;
+    return;
+  }
+
+  // Cache it: building this plan rescans the agent's whole residue inventory
+  // (~20s), so the "view script" toggle must not pay that cost again.
+  U.adminPlan = p;
+
+  box.innerHTML = `<div class="card" style="margin-top:12px">
+    <b>需要管理员权限：${p.count} 项</b>
+    <div class="sub">这些是机器级对象，普通权限无法删除。确认后将弹出一次 UAC 授权，
+      合并执行以下操作；每项在删除前都会把备份写入隔离区。</div>
+    <table style="width:100%;margin-top:8px">${
+      p.actions.map(a=>`<tr>
+        <td style="width:88px"><span class="tag">${esc(a.kind)}</span></td>
+        <td class="mono" style="font-size:12px;word-break:break-all">${esc(a.target)}
+          <div class="sub">${esc(a.reason)}</div></td>
+      </tr>`).join("")}</table>
+    <div class="row" style="margin-top:10px">
+      <button class="act ghostbtn" onclick="toggleAdminScript(${jsq(U.agent)})">查看将运行的脚本</button>
+      <button class="act" id="uAdminGo" onclick="runAdmin()"
+        ${p.already_elevated?'disabled':''}>以管理员身份执行 ${p.count} 项</button>
+      ${p.already_elevated?'<span class="sub">当前已是管理员，可直接用普通清理</span>':''}
+    </div>
+    <div id="uAdminScript"></div>
+    <div id="uAdminRun"></div>
+  </div>`;
+};
+
+window.toggleAdminScript = async (agent) => {
+  const box = $("#uAdminScript");
+  if(!box) return;
+  if(box.dataset.shown === "1"){
+    box.innerHTML = ""; box.dataset.shown = "0"; return;
+  }
+  // Use the plan already fetched for this agent; re-fetching would rescan the
+  // entire residue inventory just to display a string we already hold.
+  let p = (U.adminPlan && U.adminPlan.agent === agent) ? U.adminPlan : null;
+  if(!p){
+    box.innerHTML = `<div class="empty"><span class="spin"></span> 正在生成脚本…</div>`;
+    try { p = await api("/api/uninstall/admin-plan?agent=" + encodeURIComponent(agent)); }
+    catch(e){ box.innerHTML = `<div class="errbox">${esc(e.message)}</div>`; return; }
+  }
+  box.innerHTML = `<div class="sub" style="margin:8px 0">以下脚本将以管理员身份运行。
+      每一项都会先检查目标是否存在，然后备份，最后删除并回读验证。</div>
+    <pre class="mono" style="max-height:300px;overflow:auto;font-size:11.5px;
+      background:var(--panel2);padding:10px;border-radius:6px">${esc(p.script||"(无)")}</pre>`;
+  box.dataset.shown = "1";
+};
+
+window.runAdmin = async () => {
+  const btn = $("#uAdminGo");
+  const box = $("#uAdminRun");
+  if(!confirm("将弹出一个 UAC 授权窗口，以管理员身份删除这些机器级对象。继续？")) return;
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spin"></span> 等待管理员授权…`;
+  let r;
+  try {
+    r = await api("/api/uninstall/elevate", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({agent: U.agent, confirm: true})
+    });
+  } catch(e){ r = {ok:false, error:e.message, results:[]}; }
+
+  if(r.cancelled){
+    box.innerHTML = `<div class="warnbox"><b>已取消</b>
+      <div class="sub">${esc(r.error||"你拒绝了管理员授权。")}未做任何修改。</div></div>`;
+  } else if(!r.elevated){
+    box.innerHTML = `<div class="errbox"><b>未能提权</b><br>${esc(r.error||"未知原因")}</div>`;
+  } else {
+    const ok = (r.results||[]).filter(x=>x.ok);
+    const bad = (r.results||[]).filter(x=>!x.ok);
+    box.innerHTML = `<div class="${bad.length?'warnbox':'okbox'}">
+        <b>成功 ${ok.length} 项${bad.length?`，失败 ${bad.length} 项`:''}</b></div>
+      <table style="width:100%">${(r.results||[]).map(x=>`<tr>
+        <td style="width:24px">${x.ok?'<span style="color:var(--ok)">✓</span>'
+          :'<span style="color:var(--danger)">✗</span>'}</td>
+        <td class="mono" style="font-size:12px;word-break:break-all">${esc(x.target)}</td>
+        <td class="sub">${esc(x.error||x.note||"")}</td></tr>`).join("")}</table>
+      ${r.backup_dir?`<div class="sub" style="margin-top:8px">
+        备份已保存到隔离区：<span class="mono">${esc(r.backup_dir)}</span><br>
+        注册表可用 <span class="mono">reg import</span> 还原，快捷方式可直接复制回去。</div>`:""}`;
+  }
+  btn.disabled = false;
+  btn.textContent = "重新执行";
+};
 
 window.gotoVerify = async () => {
   U.stage = 3;

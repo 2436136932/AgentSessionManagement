@@ -298,6 +298,21 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.error_out("卸载后验证失败", 500, f"{type(e).__name__}: {e}")
 
+        # /api/uninstall/admin-plan?agent=x   -- what needs Administrator, and the
+        # exact script that would run. Read-only; safe to show before consenting.
+        if path == "/api/uninstall/admin-plan":
+            q = self._query()
+            agent = q.get("agent", "")
+            if not agent:
+                return self.error_out("缺少 agent 参数")
+            try:
+                from core import elevate
+
+                return self.json_out({"ok": True, **elevate.plan(agent)})
+            except Exception as e:
+                return self.error_out("生成提权方案失败", 500,
+                                      f"{type(e).__name__}: {e}")
+
         # /api/uninstall/report?agent=dsh
         if path == "/api/uninstall/report":
             q = self._query()
@@ -866,6 +881,41 @@ class Handler(BaseHTTPRequestHandler):
                 return self.error_out(str(e), 400)
             except Exception as e:
                 return self.error_out("归档后删除异常", 500, f"{type(e).__name__}: {e}")
+
+        # /api/uninstall/elevate  { agent, confirm, only? }
+        # The only place that raises a UAC prompt. Requires confirm=true and can
+        # only act on items already in that agent's privileged inventory.
+        if path == "/api/uninstall/elevate":
+            agent = body.get("agent", "")
+            if not agent:
+                return self.error_out("缺少 agent")
+            only = body.get("only")
+            if only is not None and not isinstance(only, list):
+                return self.error_out("only 必须是数组")
+            try:
+                from core import elevate
+
+                r = elevate.execute(
+                    agent,
+                    confirm=bool(body.get("confirm")),
+                    only=only,
+                )
+                return self.json_out({"ok": bool(r.get("ok")), **r})
+            except Exception as e:
+                return self.error_out("提权清理异常", 500, f"{type(e).__name__}: {e}")
+
+        # /api/uninstall/restore-hint?op_id=...
+        if path == "/api/uninstall/restore-hint":
+            q = self._query()
+            op_id = q.get("op_id", "")
+            if not op_id:
+                return self.error_out("缺少 op_id")
+            try:
+                from core import elevate
+
+                return self.json_out({"ok": True, **elevate.restore_hint(op_id)})
+            except Exception as e:
+                return self.error_out("读取备份失败", 500, str(e))
 
         if path == "/api/restore":
             op_id = body.get("op_id", "")

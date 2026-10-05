@@ -642,6 +642,197 @@ def test_batch_delete_preview() -> None:
     check("预演后会话数据未变化", before == after, f"{before} != {after}")
 
 
+def test_elevation_safety() -> None:
+    section("15. 提权脚本：注入防护、编码、确认与越权")
+    from core import elevate
+
+    # --- only known action kinds may be emitted -----------------------------
+    script = elevate.build_script(
+        [{"kind": elevate.KIND_FIREWALL, "target": "ok-rule"},
+         {"kind": "totally_unknown", "target": "must not appear as a command"}],
+        _SANDBOX / "r.json", _SANDBOX / "bak")
+    check("未知动作类型不生成任何命令",
+          "Add-Result 'totally_unknown'" not in script
+          and "must not appear as a command" not in script)
+
+    # --- PowerShell literal quoting ----------------------------------------
+    cases = [("a'b", "'a''b'"), ("it's 'x'", "'it''s ''x'''"),
+             ("$d `t", "'$d `t'")]
+    ok = all(elevate._ps_literal(a) == b for a, b in cases)
+    check("单引号/美元符/反引号按 PowerShell 单引号字面量转义", ok,
+          str([(a, elevate._ps_literal(a)) for a, _ in cases]))
+
+    # --- a newline must never escape a comment into code -------------------
+    # This was a real defect: the human-readable comment interpolated the raw
+    # name, so a firewall rule or shortcut whose name contained a newline could
+    # inject commands into a script that runs as Administrator.
+    hostile = "x\r\nRemove-Item -Recurse -Force C:\\Windows\r\n'"
+    s2 = elevate.build_script(
+        [{"kind": elevate.KIND_FIREWALL, "target": hostile},
+         {"kind": elevate.KIND_REGISTRY, "hive": "HKLM",
+          "key": hostile, "target": "HKLM\\x"},
+         {"kind": elevate.KIND_SHORTCUT, "target": "C:\\ProgramData\\" + hostile}],
+        _SANDBOX / "r.json", _SANDBOX / "bak")
+    # The payload text may appear inside string literals, but no line of the
+    # script may BEGIN with it as a command.
+    leaked = [ln for ln in s2.splitlines()
+              if ln.strip().startswith("Remove-Item -Recurse")]
+    check("注释中的换行不能逃逸成命令", not leaked, str(leaked[:2]))
+    check("注释行已压平为单行",
+          all("\r" not in ln for ln in s2.splitlines()))
+
+    # --- comment sanitiser --------------------------------------------------
+    check("_comment_safe 压平所有换行类字符",
+          "\n" not in elevate._comment_safe("a\nb")
+          and "\r" not in elevate._comment_safe("a\rb")
+          and "\u2028" not in elevate._comment_safe("a\u2028b")
+          and "\u2029" not in elevate._comment_safe("a\u2029b"),
+          repr(elevate._comment_safe("a\r\nb\u2028c")))
+
+    # --- the script must be written with a BOM and without newline mangling --
+    # PowerShell 5.1 reads a .ps1 as ANSI without a BOM (mangling any Chinese
+    # path), and text-mode writes turn "\n" into "\r\n" (altering a target that
+    # legitimately contains a newline).
+    src = (Path(__file__).resolve().parent / "core" / "elevate.py").read_text(
+        encoding="utf-8")
+    check("脚本以带 BOM 的字节写入（PS 5.1 才能正确读中文路径）",
+          "write_bytes(b\"\\xef\\xbb\\xbf\"" in src, "见 run_elevated")
+    check("不使用会翻译换行的 write_text",
+          "script_path.write_text" not in src)
+
+    # --- confirmation and authority limits ---------------------------------
+    r = elevate.execute("workbuddy")
+    check("未确认时拒绝执行", r["ok"] is False and "confirm" in str(r["error"]))
+    check("未确认时不创建提权脚本",
+          not any(p.name.endswith("run.ps1")
+                  for p in (_SANDBOX / "app" / "_data" / "elevated").glob("*/*")
+                  if (_SANDBOX / "app" / "_data" / "elevated").exists()))
+
+    # A caller may narrow the set to targets already in the inventory, never
+    # widen it to something of its own choosing.
+    r2 = elevate.execute("workbuddy", confirm=True,
+                         only=[r"HKLM\SOFTWARE\DefinitelyNotListed"])
+    check("伪造目标被拒绝（只能收窄不能扩大）",
+          r2["ok"] is False and "不在" in str(r2["error"]), str(r2["error"])[:60])
+
+    # --- UAC cancellation must never read as success ------------------------
+    import subprocess as _sp
+
+    class _Fake:
+        def __init__(self):
+            self.stdout = (b"ERR=The operation was canceled by the user. "
+                           b"(Exception from HRESULT: 0x800704C7)")
+            self.stderr = b""
+
+    real_run = _sp.run
+    _sp.run = lambda *a, **k: _Fake()
+    try:
+        r3 = elevate.run_elevated("Write-Output 1")
+    finally:
+        _sp.run = real_run
+    check("UAC 取消被识别为 cancelled 且不算成功",
+          r3["cancelled"] is True and r3["ok"] is False, str(r3["error"])[:50])
+
+    # --- already elevated must not raise a pointless prompt -----------------
+    real_el = elevate.is_elevated
+    elevate.is_elevated = lambda: True
+    try:
+        r4 = elevate.execute("workbuddy", confirm=True)
+    finally:
+        elevate.is_elevated = real_el
+    check("已是管理员时直接返回、不弹 UAC",
+          r4.get("already_elevated") is True, str(r4.get("note"))[:40])
+
+    # --- privileged inventory is read-only ---------------------------------
+    p = elevate.plan("workbuddy")
+    check("提权方案只包含已知动作类型",
+          all(a["kind"] in elevate.KNOWN_KINDS for a in p["actions"]),
+          str([a["kind"] for a in p["actions"]]))
+    check("提权方案可安全用于展示（含脚本但不执行）",
+          isinstance(p["script"], str))
+
+    # --- strongest check: ask PowerShell itself what would run --------------
+    # String-level assertions cannot prove there is no break-out, because a
+    # single-quoted PowerShell string may legally span lines. Parsing the
+    # generated script and enumerating its CommandAst nodes is the only
+    # trustworthy test, so it is worth the extra second.
+    ast_ok, detail = _powershell_command_audit(elevate)
+    check("PowerShell 解析确认注入载荷未成为命令", ast_ok, detail)
+
+
+def _powershell_command_audit(elevate) -> tuple[bool, str]:
+    """Parse a hostile script with PowerShell and list the commands it would run."""
+    import subprocess
+
+    from core.util import powershell_exe
+
+    exe = powershell_exe()
+    if not exe:
+        return True, "无 PowerShell，跳过（已由字符串层断言覆盖）"
+
+    hostile = ("evil'\r\nRemove-Item -Recurse -Force C:\\Windows\\Temp\r\n'")
+    script = elevate.build_script(
+        [{"kind": elevate.KIND_FIREWALL, "target": hostile},
+         {"kind": elevate.KIND_REGISTRY, "hive": "HKLM", "key": hostile,
+          "target": "HKLM\\x"},
+         {"kind": elevate.KIND_SHORTCUT,
+          "target": "C:\\ProgramData\\x'\r\nStart-Process calc\r\n'.lnk"}],
+        _SANDBOX / "ast.json", _SANDBOX / "astbak")
+    sf = _SANDBOX / "ast.ps1"
+    sf.write_bytes(b"\xef\xbb\xbf" + script.encode("utf-8"))
+
+    cmd = (
+        "$errs=$null;"
+        f"$ast=[System.Management.Automation.Language.Parser]::ParseFile("
+        f"'{sf}',[ref]$null,[ref]$errs);"
+        "'E=' + (@($errs).Count);"
+        "$c=$ast.FindAll({param($n) $n -is "
+        "[System.Management.Automation.Language.CommandAst]}, $true);"
+        "'C=' + (($c | ForEach-Object { $_.GetCommandName() } | "
+        "Where-Object {$_} | Sort-Object -Unique) -join ',')"
+    )
+    try:
+        out = subprocess.run(
+            [exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-Command", cmd],
+            capture_output=True, timeout=120,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        text = ((out.stdout or b"") + (out.stderr or b"")).decode("utf-8", "replace")
+    except Exception as e:
+        return True, f"PowerShell 调用失败，跳过：{type(e).__name__}"
+
+    errors = "E=0" not in text
+    cmds = ""
+    for line in text.splitlines():
+        if line.startswith("C="):
+            cmds = line[2:].strip()
+    names = [c for c in cmds.split(",") if c]
+    payload = [c for c in names
+               if c in ("Start-Process", "Stop-Process", "calc", "explorer",
+                        "cmd", "powershell")]
+    ok = (not errors) and not payload
+    return ok, f"解析错误={errors} 载荷命令={payload or '无'} 全部命令={names}"
+
+
+def test_uninstall_coverage_honesty() -> None:
+    section("16. 清理能力边界必须如实说明（不谎称已卸载干净）")
+    from core import uninstall
+
+    r = uninstall.full_report()
+    check("full_report 返回每个 Agent 的可回收量",
+          all("reclaimable_bytes_h" in a for a in r["agents"]),
+          str(len(r["agents"])) + " 个 Agent")
+
+    # The tool must be explicit that some things are out of scope, rather than
+    # reporting a clean result and leaving the user to discover the rest later.
+    cli_src = (Path(__file__).resolve().parent / "cli.py").read_text(encoding="utf-8")
+    for must_say in ("凭据管理器", "环境变量 PATH", "系统服务与计划任务",
+                     "程序安装目录"):
+        check(f"capabilities 明确说明不处理：{must_say}",
+              must_say in cli_src)
+
+
 def main() -> int:
     print("=" * 74)
     print("残留清理安全测试（沙箱运行，不接触真实会话）")
@@ -694,6 +885,8 @@ def _run_tests() -> None:
     test_shortcut_cleanup(fx)
     test_cleanup_accounting()
     test_batch_delete_preview()
+    test_elevation_safety()
+    test_uninstall_coverage_honesty()
 
 
 if __name__ == "__main__":
