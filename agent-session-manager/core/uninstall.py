@@ -403,12 +403,31 @@ def execute_cleanup(
                 continue
             chosen.append(item)
 
+    # ---- routing: every selected item is executed or reported, never dropped
+    #
+    # A shortcut is an ordinary .lnk file, so it goes through the reversible
+    # file path (moved into the quarantine). It used to be excluded here and
+    # then never handled anywhere else, which meant a Start Menu shortcut was
+    # silently ignored: selected, reported as cleaned, still on disk.
+    shortcut_paths = [c["path"] for c in chosen
+                      if c.get("kind") == "shortcut" and not c.get("needs_admin")]
+
     file_paths = [c["path"] for c in chosen
                   if c.get("kind") not in ("registry", "firewall", "shortcut",
                                            "autostart", "system", "registry_blocked")]
+    file_paths += shortcut_paths
+
     registry_keys = [c for c in chosen if c.get("kind") == "registry"]
     firewall = [c for c in chosen if c.get("kind") == "firewall"]
-    needs_admin = [c for c in chosen if c.get("needs_admin")]
+
+    # Anything not routed above needs a human: it either needs elevation, or it
+    # is a system object this tool deliberately only reports. Computing it from
+    # the chosen set (rather than trusting each item's `needs_admin` flag) is
+    # what guarantees the accounting identity below holds.
+    handled_paths = set(file_paths)
+    handled_paths |= {c["path"] for c in registry_keys}
+    handled_paths |= {c["path"] for c in firewall}
+    reported = [c for c in chosen if c.get("path") not in handled_paths]
 
     result: dict = {
         "ok": True,
@@ -418,9 +437,15 @@ def execute_cleanup(
         "file_ops": None,
         "registry_ops": [],
         "firewall_ops": [],
+        "reported": [
+            {"path": c.get("path"), "kind": c.get("kind"),
+             "needs_admin": bool(c.get("needs_admin")),
+             "reason": c.get("evidence", ""),
+             "command": _admin_command(c)} for c in reported
+        ],
         "needs_admin": [
             {"path": c.get("path"), "kind": c.get("kind"),
-             "command": _admin_command(c)} for c in needs_admin
+             "command": _admin_command(c)} for c in reported if c.get("needs_admin")
         ],
         "files": {"removed": 0, "failed": 0, "bytes": 0, "bytes_h": "0 B"},
     }
@@ -467,14 +492,29 @@ def execute_cleanup(
 
     removed = result["files"]["removed"]
     failed = result["files"]["failed"]
+
+    # Accounting identity, exposed so a caller (or a test) can check that the
+    # result adds up: every selected item was either executed or reported.
+    executed = removed + len([o for o in result["registry_ops"] if o.get("ok")])
+    result["accounting"] = {
+        "selected": len(chosen),
+        "executed_or_attempted": len(file_paths) + len(registry_keys)
+                                 + len(firewall),
+        "reported": len(reported),
+        "balances": (len(file_paths) + len(registry_keys) + len(firewall)
+                     + len(reported)) == len(chosen),
+    }
+
     if dry_run:
         result["note"] = (
             f"预演：将移除 {result['files'].get('would_remove', 0)} 项"
             f"（{result['files'].get('would_remove_bytes_h', '0 B')}）"
             f"，拒绝 {failed} 项"
-            + (f"；{len(result['needs_admin'])} 项需要管理员权限。"
-               if result["needs_admin"] else "。")
-            + " 未修改任何文件。"
+            + (f"；{len(result['needs_admin'])} 项需要管理员权限"
+               if result["needs_admin"] else "")
+            + (f"；{len(reported) - len(result['needs_admin'])} 项只能手动处理"
+               if len(reported) > len(result["needs_admin"]) else "")
+            + "。未修改任何文件。"
         )
         return result
     result["note"] = (
@@ -482,6 +522,8 @@ def execute_cleanup(
         + (f"，{failed} 项失败" if failed else "")
         + (f"；{len(result['needs_admin'])} 项需要管理员权限，见 needs_admin。"
            if result["needs_admin"] else "。")
+        + (f" 另有 {len(reported)} 项需手动处理，见 reported。"
+           if reported else "")
     )
     return result
 

@@ -36,7 +36,7 @@ from core import (  # noqa: E402
 )
 from core.cleaner import CleanupError  # noqa: E402
 from core.executor import ExecutionError, Executor  # noqa: E402
-from core.util import plat  # noqa: E402
+from core.util import human_size, plat  # noqa: E402
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 HOST = "127.0.0.1"
@@ -513,10 +513,52 @@ class Handler(BaseHTTPRequestHandler):
             return self.error_out("请求体不是合法 JSON")
 
         if path == "/api/delete":
+            from adapters.registry import get_adapter
+            from core.executor import plan_fingerprint
+
             agent = body.get("agent", "")
             sid = body.get("sid", "")
             if not agent or not sid:
                 return self.error_out("缺少 agent 或 sid")
+
+            # Uniform preview: every destructive endpoint accepts `dry_run`, so
+            # a caller never has to know that this one's preview lives at a
+            # different URL (/api/plan). Nothing is touched on this path.
+            if body.get("dry_run"):
+                adapter = get_adapter(agent)
+                if adapter is None:
+                    return self.error_out(f"未知的 Agent：{agent}", 404)
+                try:
+                    plan = adapter.plan_delete(sid)
+                    problems = Executor.validate(plan, adapter)
+                    session = inventory.find(agent, sid)
+                    cwd = (session.cwd if session else "") or ""
+                    refusal = Executor.check_pinned(
+                        plan,
+                        allow_unpin=bool(body.get("allow_unpin")),
+                        cwd=cwd,
+                    )
+                    payload = plan.to_dict()
+                    payload["validation_problems"] = problems
+                    payload["pinned_refusal"] = refusal
+                    payload["can_execute"] = not (
+                        plan.blocked or problems or refusal
+                    )
+                    payload["fingerprint"] = plan_fingerprint(plan)
+                    return self.json_out(
+                        {
+                            "ok": True,
+                            "dry_run": True,
+                            "agent": agent,
+                            "sid": sid,
+                            "plan": payload,
+                            "note": "这是预演结果，未修改任何数据。",
+                        }
+                    )
+                except Exception as e:
+                    return self.error_out("生成预演失败", 500,
+                                          f"{type(e).__name__}: {e}")
+
             ex = Executor()
             try:
                 result = ex.execute(
@@ -675,11 +717,40 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.error_out("还原异常", 500, f"{type(e).__name__}: {e}")
 
-        # /api/uninstall/run  { agent }  -- the only irreversible step
+        # /api/uninstall/run  { agent, confirm }  -- the only irreversible step
         if path == "/api/uninstall/run":
             agent = body.get("agent", "")
             if not agent:
                 return self.error_out("缺少 agent")
+            # A preview needs no confirmation: it changes nothing. Only the real
+            # invocation requires the explicit opt-in.
+            if body.get("dry_run"):
+                try:
+                    pf = uninstall.preflight(agent)
+                    entry = pf.get("uninstall") or {}
+                    from core.cleaner import uninstall_command
+
+                    cmd = uninstall_command({
+                        "quiet_uninstall_string": entry.get("command", "")
+                        if entry.get("silent") else "",
+                        "uninstall_string": entry.get("command", ""),
+                    })
+                    return self.json_out(
+                        {
+                            "ok": True,
+                            "dry_run": True,
+                            "agent": agent,
+                            "available": cmd["available"],
+                            "silent": cmd["silent"],
+                            "command": cmd["command"],
+                            "can_proceed": pf.get("can_proceed"),
+                            "blockers": pf.get("blockers") or [],
+                            "note": "预演：未启动任何卸载程序。" + cmd.get("note", ""),
+                        }
+                    )
+                except Exception as e:
+                    return self.error_out("卸载预检失败", 500,
+                                          f"{type(e).__name__}: {e}")
             if not body.get("confirm"):
                 return self.error_out(
                     "必须显式确认：调用官方卸载器不可撤销，请传入 confirm=true。", 400
@@ -715,13 +786,32 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.error_out("保存策略失败", 500, str(e))
 
-        # /api/quarantine/purge  { mode?, op_ids? }
+        # /api/quarantine/purge  { mode?, op_ids?, dry_run? }
         if path == "/api/quarantine/purge":
             op_ids = body.get("op_ids")
             if op_ids is not None and not isinstance(op_ids, list):
                 return self.error_out("op_ids 必须是数组")
+            mode = body.get("mode") or "expired"
             try:
-                r = quarantine.purge(body.get("mode") or "expired", op_ids=op_ids)
+                # `dry_run` must be honoured here: this endpoint used to ignore
+                # it and purge for real, so a caller asking for a preview lost
+                # their undo buffer.
+                if body.get("dry_run"):
+                    plan = quarantine.plan_purge(mode)
+                    if op_ids:
+                        wanted = set(op_ids)
+                        plan["entries"] = [e for e in plan["entries"]
+                                           if e["op_id"] in wanted]
+                        plan["count"] = len(plan["entries"])
+                        plan["bytes"] = sum(e["size"] for e in plan["entries"])
+                        plan["bytes_h"] = human_size(plan["bytes"])
+                    plan["dry_run"] = True
+                    plan["note"] = (
+                        f"预演：将清空 {plan['count']} 项，释放 {plan['bytes_h']}。"
+                        f"{plan.get('note', '')} 未删除任何内容。"
+                    )
+                    return self.json_out({"ok": True, **plan})
+                r = quarantine.purge(mode, op_ids=op_ids)
                 return self.json_out({"ok": True, **r})
             except Exception as e:
                 return self.error_out("清空隔离区失败", 500, str(e))
@@ -792,6 +882,84 @@ class Handler(BaseHTTPRequestHandler):
             items = body.get("items") or []
             if not isinstance(items, list):
                 return self.error_out("items 必须是数组")
+            # items entries must be objects; a bare string would otherwise blow
+            # up on .get() far from the actual mistake.
+            if any(not isinstance(it, dict) for it in items):
+                return self.error_out("items 的每一项都必须是对象")
+
+            allow_unpin = bool(body.get("allow_unpin"))
+            permanent = bool(body.get("permanent"))
+            dry_run = bool(body.get("dry_run"))
+
+            # A batch is the most dangerous operation in the tool, so it gets a
+            # preview like everything else: every item is planned and checked,
+            # nothing is touched.
+            if dry_run:
+                from adapters.registry import get_adapter
+                from core.executor import plan_fingerprint
+
+                preview = []
+                would = 0
+                would_bytes = 0
+                for it in items[:200]:
+                    agent, sid = it.get("agent", ""), it.get("sid", "")
+                    entry = {"agent": agent, "sid": sid}
+                    adapter = get_adapter(agent)
+                    if adapter is None:
+                        entry.update({"ok": False, "blocked": True,
+                                      "error": f"未知的 Agent：{agent}"})
+                        preview.append(entry)
+                        continue
+                    try:
+                        plan = adapter.plan_delete(sid)
+                        problems = Executor.validate(plan, adapter)
+                        session = inventory.find(agent, sid)
+                        cwd = (session.cwd if session else "") or ""
+                        refusal = Executor.check_pinned(
+                            plan, allow_unpin=allow_unpin, cwd=cwd
+                        )
+                        blocked = bool(plan.blocked or problems or refusal)
+                        entry.update(
+                            {
+                                "ok": not blocked,
+                                "blocked": blocked,
+                                "title": plan.title,
+                                "actions": len(plan.actions),
+                                "size": plan.total_size,
+                                "size_h": human_size(plan.total_size),
+                                "fingerprint": plan_fingerprint(plan),
+                                "error": plan.block_reason or refusal
+                                         or ("；".join(problems) if problems else ""),
+                            }
+                        )
+                        if not blocked:
+                            would += 1
+                            would_bytes += plan.total_size
+                    except Exception as e:
+                        entry.update({"ok": False, "blocked": True,
+                                      "error": f"{type(e).__name__}: {e}"})
+                    preview.append(entry)
+
+                blocked_n = len(preview) - would
+                return self.json_out(
+                    {
+                        "ok": True,
+                        "dry_run": True,
+                        "selected": len(preview),
+                        "would_delete": would,
+                        "would_delete_bytes": would_bytes,
+                        "would_delete_bytes_h": human_size(would_bytes),
+                        "blocked": blocked_n,
+                        "items": preview,
+                        "note": (
+                            f"预演：将删除 {would} 个会话"
+                            f"（约 {human_size(would_bytes)}）"
+                            + (f"，{blocked_n} 个会被安全检查阻止" if blocked_n else "")
+                            + "。未修改任何数据。"
+                        ),
+                    }
+                )
+
             ex = Executor()
             results = []
             for it in items[:200]:
@@ -800,8 +968,8 @@ class Handler(BaseHTTPRequestHandler):
                     r = ex.execute(
                         agent,
                         sid,
-                        allow_permanent=bool(body.get("permanent")),
-                        allow_unpin=bool(body.get("allow_unpin")),
+                        allow_permanent=permanent,
+                        allow_unpin=allow_unpin,
                     )
                     results.append({"agent": agent, "sid": sid, "ok": True,
                                     "op_id": r.get("op_id"), "title": r.get("title")})

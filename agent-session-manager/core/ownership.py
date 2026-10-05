@@ -71,6 +71,10 @@ CATEGORY_DISPOSITION = {
     "plugin": REVIEW,
     "binary": REVIEW,
     "install": REVIEW,
+    # A shortcut is only ever `review`: this classifier cannot see what a .lnk
+    # points at, and a shortcut to a live program is not residue. The plan layer
+    # checks the real target and upgrades a genuinely orphaned one to `safe`.
+    "shortcut": REVIEW,
     "user_data": NEVER,
     "shared": NEVER,
     "source_repo": NEVER,
@@ -89,6 +93,7 @@ CATEGORY_LABELS = {
     "plugin": "插件/扩展",
     "binary": "内置二进制",
     "install": "安装目录",
+    "shortcut": "快捷方式",
     "user_data": "用户数据",
     "shared": "共享资源",
     "source_repo": "源码仓库",
@@ -347,7 +352,21 @@ def _downgrade(disposition: str) -> str:
 
 
 def _shared_hit(parts: tuple[str, ...]) -> str:
-    for part in parts:
+    """The shared container this path lives in, or ''.
+
+    Only the first two components *below the drive anchor* are considered.
+    The intent of this rule is "do not delete a shared install root such as
+    `C:\\Program Files` or `C:\\Windows`", and those are decided at the top of
+    the tree. Scanning every component instead produces false refusals deep in
+    user-owned paths: `%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs`
+    contains both "Microsoft" and "Windows", which made every Start Menu
+    shortcut look like a shared system resource and therefore undeletable.
+    """
+    # parts looks like ('C:\\', 'Users', 'admin', 'AppData', ...) on Windows.
+    if not parts:
+        return ""
+    tail = [p for p in parts[1:] if p not in ("\\", "/")]
+    for part in tail[:2]:
         if part.lower() in SHARED_CONTAINERS:
             return part
     return ""
@@ -469,6 +488,13 @@ class Classifier:
                 return "log", f"扩展名 {p.suffix} 属于日志文件"
             if p.suffix.lower() == ".tmp":
                 return "temp", f"扩展名 {p.suffix} 属于临时文件"
+            # A Windows shortcut is a small file that can be moved into the
+            # quarantine and restored, so it is actionable residue -- but this
+            # classifier cannot read its target, so it stays `review`.
+            if p.suffix.lower() == ".lnk":
+                return "shortcut", f"文件名 “{p.name}” 是 Windows 快捷方式"
+            if p.suffix.lower() in (".url",):
+                return "shortcut", f"文件名 “{p.name}” 是 Internet 快捷方式"
             # A SQLite sidecar carries the same weight as its database: the
             # WAL holds committed transactions and the journal holds an
             # in-flight rollback. Sweeping them corrupts the store, so they are

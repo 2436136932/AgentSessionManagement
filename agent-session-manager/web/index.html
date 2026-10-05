@@ -775,7 +775,7 @@ window.clearPicks = () => {
   updatePickBar();
 };
 
-window.batchDelete = () => {
+window.batchDelete = async () => {
   const items = picked();
   if(!items.length) return;
   const byAgent = {};
@@ -785,17 +785,46 @@ window.batchDelete = () => {
     const s = (STATE.sessions||[]).find(x => x.agent===i.agent && x.sid===i.sid);
     return s && s.protected;
   }).length;
+
+  // Show the plan first. A batch is the most dangerous action here, and until
+  // now it went straight from "tick some boxes" to "delete", with no way to see
+  // which items the safety checks would refuse.
   modal(`<h2>批量删除 ${items.length} 个会话</h2>
     <div class="sub">${esc(summary)}</div>
+    <div class="empty"><span class="spin"></span> 正在预检每一项（不会修改任何数据）…</div>`);
+  let pv;
+  try {
+    pv = await api("/api/batch-delete", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({items, dry_run:true})
+    });
+  } catch(e){ pv = {ok:false, error:e.message}; }
+  if(!pv || !pv.ok){
+    modal(`<h2>预检失败</h2><div class="errbox">${esc((pv&&pv.error)||"")}</div>
+      <div class="row"><button class="act ghostbtn" onclick="closeModal()">关闭</button></div>`);
+    return;
+  }
+
+  const blocked = (pv.items||[]).filter(x=>x.blocked);
+  modal(`<h2>批量删除 ${items.length} 个会话</h2>
+    <div class="sub">${esc(summary)}</div>
+    <div class="${pv.would_delete?'okbox':'warnbox'}">
+      <b>${esc(pv.note||"")}</b></div>
     ${pinnedCount?`<div class="warnbox"><b>其中 ${pinnedCount} 个已标记「保留」</b>，
       默认会被跳过。如需一并删除，请勾选下面的「忽略保留标记」。</div>`:''}
     <div class="warnbox">每个会话都会先经过独立的<b>安全检查与删除后校验</b>；
       被阻止的（例如 Agent 正在运行、会话正在使用）会被单独跳过，不会影响其他项。
       全部数据默认进入隔离区，可逐一还原。</div>
-    <div class="actions-list">${items.map(i=>{
+    ${blocked.length?`<div class="warnbox"><b>以下 ${blocked.length} 项会被跳过：</b><br>${
+      blocked.map(b=>`<span class="mono">${esc(b.sid)}</span> — ${esc(b.error||"")}`).join('<br>')
+    }</div>`:''}
+    <div class="actions-list">${(pv.items||[]).map(i=>{
       const s = (STATE.sessions||[]).find(x => x.agent===i.agent && x.sid===i.sid);
       return `<div><span class="k">${esc(i.agent)}</span><span class="mono">${esc(i.sid)}</span>
-        ${s&&s.protected?'<span class="tag" style="color:var(--warn)">保留</span>':''}</div>`;
+        ${i.size_h?`<span class="tag">${esc(i.size_h)}</span>`:''}
+        ${i.blocked?'<span class="tag" style="color:var(--danger)">将跳过</span>':''}
+        ${s&&s.protected?'<span class="tag" style="color:var(--warn)">保留</span>':''}
+        ${esc(i.title||"")}</div>`;
     }).join('')}</div>
     <label class="chk"><input type="checkbox" id="bPerm">
       永久删除（<b>不进隔离区，无法还原</b>）</label>
@@ -803,7 +832,9 @@ window.batchDelete = () => {
       忽略保留标记（<b>仅本次</b>，不会取消标记）</label>`:''}
     <div class="row">
       <button class="act ghostbtn" onclick="closeModal()">取消</button>
-      <button class="act" id="batchGo" onclick="runBatch()">确认删除 ${items.length} 项</button>
+      <button class="act" id="batchGo" onclick="runBatch()"
+        ${pv.would_delete?'':'disabled'}>确认删除 ${pv.would_delete} 项${
+        blocked.length?`（跳过 ${blocked.length} 项）`:''}</button>
     </div>`);
 };
 

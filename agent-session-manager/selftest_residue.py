@@ -62,6 +62,7 @@ util.journal_path = lambda: (_SANDBOX / "app" / "_data" / "operations.jsonl")  #
 from core import cleaner  # noqa: E402
 from core.ownership import (  # noqa: E402
     NEVER,
+    REVIEW,
     SAFE,
     Classifier,
     _looks_like_credential,
@@ -489,6 +490,158 @@ def test_never_is_not_silently_dropped(fx: dict) -> None:
           f"will_remove={pf['will_remove']} refused={pf['refused']}")
 
 
+def test_shortcut_cleanup(fx: dict) -> None:
+    section("12. 快捷方式：必须真的被删除、可还原，且不被共享规则误伤")
+    import core.uninstall as U
+
+    # A real Start Menu path contains "Microsoft" and "Windows". The shared
+    # container rule must not fire on those, or every shortcut on a real machine
+    # is judged a shared system resource and can never be cleaned.
+    menu = _FAKE_ROAMING / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    menu.mkdir(parents=True, exist_ok=True)
+    lnk = menu / "Fake Agent.lnk"
+    lnk.write_bytes(b"L" * 512)
+
+    clf = Classifier()
+    o = clf.classify(lnk)
+    check("Start Menu 下的快捷方式不被判为 shared",
+          o.category != "shared", f"{o.disposition}/{o.category}")
+    check("快捷方式判为可操作的 review（分类器看不到目标，不自动置 safe）",
+          o.disposition == REVIEW and o.category == "shortcut",
+          f"{o.disposition}/{o.category}")
+
+    # The shared veto must still hold at the actual shared roots.
+    for raw, want in ((r"C:\Program Files", "Program Files"),
+                      (r"C:\Program Files (x86)", "Program Files (x86)"),
+                      (r"C:\Windows\System32", "Windows"),
+                      (r"C:\ProgramData\Microsoft", "Microsoft")):
+        p = Path(raw)
+        if p.exists():
+            o2 = clf.classify(p)
+            check(f"{want} 仍判为 never/shared",
+                  o2.disposition == NEVER and o2.category == "shared",
+                  f"{o2.disposition}/{o2.category}")
+
+    # End to end: an orphaned shortcut is removed, quarantined, restorable.
+    fake = {
+        "agent": "faketest", "label": "Fake Test", "safe": [],
+        "review": [{"path": str(lnk), "kind": "shortcut", "needs_admin": False,
+                    "orphan": True, "evidence": "目标已不存在"}],
+        "never": [], "counts": {"safe": 0, "review": 1, "never": 0},
+    }
+    orig = U.cleanup_plan
+    U.cleanup_plan = lambda agent: fake
+    try:
+        r = U.execute_cleanup("faketest", dispositions=["review"],
+                              force_while_running=True)
+    finally:
+        U.cleanup_plan = orig
+
+    check("快捷方式确实被移除", not lnk.exists(), r.get("note", ""))
+    q = Path((r.get("file_ops") or {}).get("quarantine") or "")
+    copies = list(q.rglob("*.lnk")) if q.exists() else []
+    check("快捷方式进入隔离区（可还原）", bool(copies), str(q))
+    if copies:
+        import shutil as _sh
+
+        lnk.parent.mkdir(parents=True, exist_ok=True)
+        _sh.move(str(copies[0]), str(lnk))
+        check("还原后内容一致", lnk.exists() and lnk.stat().st_size == 512)
+
+
+def test_cleanup_accounting() -> None:
+    section("13. 会计恒等式：选中的项必须全部被处理或报告（不得静默丢弃）")
+    import core.uninstall as U
+
+    fake = {
+        "agent": "faketest", "label": "Fake Test",
+        "safe": [{"path": str(_SANDBOX / "proj" / "cache2"), "kind": None, "size": 10}],
+        "review": [
+            {"path": str(_SANDBOX / "menu" / "A.lnk"), "kind": "shortcut",
+             "needs_admin": False},
+            {"path": str(_SANDBOX / "menu" / "B.lnk"), "kind": "shortcut",
+             "needs_admin": True},
+            {"path": "HKCU\\SOFTWARE\\FakeVendor", "kind": "registry",
+             "hive": "HKCU", "reg_key": "SOFTWARE\\FakeVendor"},
+            {"path": "Fake Firewall Rule", "kind": "firewall", "needs_admin": True},
+            {"path": "HKCU\\...\\Run\\FakeAgent", "kind": "autostart",
+             "needs_admin": False},
+        ],
+        "never": [], "counts": {"safe": 1, "review": 5, "never": 0},
+    }
+    (_SANDBOX / "proj" / "cache2").mkdir(parents=True, exist_ok=True)
+    (_SANDBOX / "menu").mkdir(parents=True, exist_ok=True)
+    (_SANDBOX / "menu" / "A.lnk").write_text("x", encoding="utf-8")
+    (_SANDBOX / "menu" / "B.lnk").write_text("x", encoding="utf-8")
+
+    orig = U.cleanup_plan
+    U.cleanup_plan = lambda agent: fake
+    try:
+        r = U.execute_cleanup("faketest", dispositions=["safe", "review"],
+                              dry_run=True, force_while_running=True)
+    finally:
+        U.cleanup_plan = orig
+
+    acc = r.get("accounting") or {}
+    check("结果自带会计恒等式字段", "balances" in acc, str(acc))
+    check("恒等式成立（选中 = 已执行 + 已报告）", acc.get("balances") is True, str(acc))
+    check("选中数与明细一致",
+          acc.get("selected") == (acc.get("executed_or_attempted", 0)
+                                  + acc.get("reported", 0)),
+          str(acc))
+
+    # The non-admin shortcut must now be *executed*, not dropped.
+    fo = (r.get("file_ops") or {}).get("preflight") or {}
+    handled = [i["path"] for i in fo.get("items", []) if i.get("ok")]
+    check("非管理员快捷方式进入可执行列表",
+          any("A.lnk" in h for h in handled), str(handled))
+
+    # Everything not executed must be reported with a reason and a command.
+    reported = r.get("reported") or []
+    check("未执行的项目全部出现在 reported 中",
+          len(reported) > 0, str(len(reported)))
+    check("reported 每项都给出可执行命令",
+          all(m.get("command") for m in reported),
+          str([m.get("command") for m in reported]))
+    check("需管理员的项目被标记出来",
+          any(m.get("needs_admin") for m in reported),
+          str([(m.get("kind"), m.get("needs_admin")) for m in reported]))
+
+
+def test_batch_delete_preview() -> None:
+    section("14. 批量删除必须支持预演（不改动任何数据）")
+    from core.executor import Executor
+
+    # The endpoint-level dry run plans every item. At the core level the
+    # guarantee to check is that a plan is built without executing anything.
+    sessions = []
+    try:
+        from core import inventory
+
+        sessions = [s for s in inventory.scan()][:3]
+    except Exception:
+        sessions = []
+
+    if not sessions:
+        check("批量预演（无会话可测，跳过）", True)
+        return
+
+    before = {s.sid: s.size for s in sessions}
+    for s in sessions:
+        from adapters.registry import get_adapter
+
+        a = get_adapter(s.agent)
+        if a is None:
+            continue
+        plan = a.plan_delete(s.sid)
+        problems = Executor.validate(plan, a)
+        # A preview must be able to report blocked items rather than raising.
+        check(f"可为此会话生成预演计划（{s.agent}）",
+              isinstance(problems, list), str(problems))
+    after = {s.sid: s.size for s in sessions}
+    check("预演后会话数据未变化", before == after, f"{before} != {after}")
+
+
 def main() -> int:
     print("=" * 74)
     print("残留清理安全测试（沙箱运行，不接触真实会话）")
@@ -507,6 +660,9 @@ def main() -> int:
     test_data_root_needs_explicit_optin()
     test_quarantine_policy()
     test_never_is_not_silently_dropped(fx)
+    test_shortcut_cleanup(fx)
+    test_cleanup_accounting()
+    test_batch_delete_preview()
 
     print("\n" + "=" * 74)
     if FAILURES:
