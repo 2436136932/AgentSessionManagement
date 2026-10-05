@@ -45,6 +45,27 @@ python server.py --port 9000 --no-browser
 
 浏览器会自动打开。按 `Ctrl+C` 停止。
 
+**命令行**：所有功能也可脚本化，见 [cli.py](cli.py)。
+
+```powershell
+python cli.py scan                       # 扫描所有 Agent 的会话与占用
+python cli.py sessions --agent dsh       # 列出会话
+python cli.py plan --agent dsh --sid <id>    # 审阅删除计划（只读）
+python cli.py delete --agent dsh --sid <id> --yes
+python cli.py residue --agent workbuddy  # 残留报告（只读）
+python cli.py cleanup --agent workbuddy --dry-run
+python cli.py cleanup --agent workbuddy --dispositions safe
+python cli.py uninstall --agent workbuddy --preflight-only
+python cli.py quarantine                 # 隔离区与保留策略
+python cli.py history --record           # 记录占用快照
+python cli.py dupes                      # 重复内容检测（只读）
+python cli.py secrets                    # 敏感信息扫描（只读）
+python cli.py projects                   # 按项目聚合
+python cli.py report                     # 各 Agent 卸载/回收概览
+```
+
+退出码：`0` 成功，`1` 错误，`2` 被安全检查拒绝。所有破坏性命令都需要 `--yes`，且都支持 `--dry-run`。
+
 **要求**：Python 3.12+（用到标准库 `compression.zstd`，3.14 已内置）。**无需安装任何第三方包。**
 
 ---
@@ -58,7 +79,30 @@ python server.py --port 9000 --no-browser
 | **内容搜索** | **在会话正文中全文检索**（不只是标题），支持按 Agent 过滤、正则、大小写敏感，命中处高亮上下文 |
 | **用量** | 按会话统计 **token 用量与费用**：输入 / 输出 / 缓存读取 / 合计，以及 Agent 自己记录的费用 |
 | **清理建议** | **保留规则筛选**（幽灵 / 孤儿 / 空会话 / 长期未用 / 零碎小会话 / 体积过大 / 从未打开）+ 结构性问题（无引用附件、空目录、软删除残留、空数据库） |
-| **操作记录** | 每次删除的完整记录，可**一键还原** |
+| **卸载清理** | **彻底退场**：按 Agent 预检 → 调用官方卸载器 → 卸载后验证 → **残留分级清理**（可安全 / 需确认 / 禁止）→ 报告与还原；含隔离区保留策略 |
+| **操作记录** | 每次删除与清理的完整记录，可**一键还原** |
+
+### 卸载清理页做了什么
+
+这是「不想用某个 Agent 了，想删干净」的入口。实测它在本机发现了 **350.4 MB 可安全回收**的残留（缓存、日志、空壳目录），以及不删就会一直留着的密钥文件、注册表键、防火墙规则和快捷方式。
+
+**分级处置**是这一页的核心。每一项残留都归入三档之一，并附**判定依据**：
+
+| 档位 | 含义 | 默认 |
+|---|---|---|
+| 可安全清理 | 明确属于该 Agent 且可再生（纯缓存、日志、空目录） | 已勾选 |
+| 需人工确认 | 属于该 Agent 但可能有用（会话、配置、插件、二进制、凭据） | 未勾选 |
+| 禁止删除 | 用户数据、共享资源、源码仓库 | 只读展示原因 |
+
+之所以要有第三档，是因为本机真实存在 `E:\workbuddyapi-main`——一个用户自己的 git 仓库，里面恰好有个 `.codebuddy` 目录。任何"按关键词扫盘"的清理工具都会把它删掉。归属模型（`core/ownership.py`）按**证据**而不是名字判定：`.git` / `package.json` 等特征文件命中即判 `禁止`，并且在**执行前重新分类**（纵深防御，`selftest_residue.py` 专门断言这一点）。
+
+**5 阶段向导**：预检（进程 / 保留标记 / 凭据）→ 调用官方卸载器（注册表里的 `QuietUninstallString`，唯一不可逆的一步，必须勾选确认框 + `confirm()`）→ 卸载后验证（重新扫描，不信卸载器的"成功"返回值）→ 残留分级清理（支持**预演**，未确认前不碰任何文件）→ 报告与还原。
+
+**其它保障**：`HKLM` 键与防火墙规则需要管理员，本工具**不会尝试提权**，而是给出可复制的命令；删注册表键前先 `reg export` 备份到隔离区，可还原；Agent 运行中只允许预演，真正执行会被拒绝。
+
+### 归属与缓存
+
+总览里的「占用空间」是 Agent 整棵目录树。实测 **DSH 745 MB 里真正的会话只有 7.7 MB（约 1%）**，其余是浏览器内核、组件缓存和插件。「卸载清理」页把这两者分开：可再生缓存（`GPUCache`、`component_crx_cache` 等）判为可安全清理；**有状态存储**（`Local Storage`、`state.vscdb`、数据库预写日志）判为需确认——删了会丢失登录态或损坏数据库。
 
 ### 价值分级（辅助判断该不该删）
 
@@ -302,6 +346,7 @@ python run_all_tests.py
 | `selftest_preview.py` | 预览解析（各种消息类型）、幽灵/空/云端/残留四种说明、恶意 ID 不致崩、**逐字节证明预览无写入** | **沙箱 + 真实数据只读** |
 | `selftest_safety.py` | **保留标记（会话级 + 工作区级）阻止删除**、工作区路径边界（`test2` 不被 `test` 误伤）、显式覆盖、**指纹校验拒绝过期确认**、保留规则标注原因且不误报保留项、标签/备注往返 | **沙箱** |
 | `selftest_hostile.py` | 5 个适配器 × 24 个恶意会话 ID（路径穿越、绝对路径、空字节、保留名等）→ **不得产生任何越界操作** | 只读 |
+| `selftest_residue.py` | **归属分级**（safe/review/never）、**git 仓库绝不被清**（真实误删反例 `workbuddyapi-main`）、共享容器拒绝、凭据识别精度（真密钥报、打包运行时不报）、缓存 vs 有状态存储、**执行器纵深防御**、**预演零写入**、运行中进程门禁、数据根显式确认、隔离区保护期 | **沙箱** |
 | `selftest_delete.py` | DSH 计划/删除/校验/还原、越界拒绝、活动会话保护、共享附件保护 | **沙箱** |
 | `selftest_sqlite.py` | WorkBuddy 行删除与还原、Copilot 五张子表 + **FTS 索引**、VS Code 聊天索引、`VACUUM`、**CodeBuddy 项目层级保护** | **沙箱** |
 | `selftest_realdb.py` | 用**真实数据库的副本**跑完整删除→校验→还原，逐表比对**每一行** | **只读原件**，只写副本 |
@@ -319,6 +364,11 @@ python run_all_tests.py
 - **预览会话内容前后，整个存储目录的哈希完全一致**（证明预览确实只读）
 - **已标记「保留」的会话拒绝删除**；同一批里的其他会话不受影响
 - **确认后内容若被改动，删除被取消**（指纹不匹配）
+- **git 仓库（含仓库内的 Agent 目录）被判 `never`，预检与执行两层都拒绝，且执行后仓库完好**
+- **含点文件名不会命中 reverse-DNS 规则**（`state.vscdb` 必须判 user_data，不能是 safe）
+- **预演前后存储目录哈希一致，且不产生新的隔离区目录**
+- **运行中：预演放行、真正执行拒绝、被拒后数据完好；显式 force 才可继续**
+- **隔离区保护期内的条目，即使显式指定也不清除**
 - 保留规则**只建议不执行**，且绝不把保留项列为候选
 - 越界路径、活动会话、未知会话一律**拒绝**
 - 全部套件运行后 **临时沙箱零残留**（防止"删不干净"的问题出现在本工具自己身上）
@@ -342,6 +392,14 @@ python run_all_tests.py
 | `with sqlite3.connect(...)` 当关闭用 | Python 里它只提交事务、**不关闭句柄** → 备份文件在 Windows 上被锁住，隔离区**删不干净**（WinError 32） | `core/executor.py`, 两个适配器 |
 | `rmtree(ignore_errors=True)` 吞掉失败 | 删除失败静默无感，留下空目录骨架（正是本工具要消灭的那类残留） | `core/util.py` `remove_tree` |
 | 静态审计导入了 `selftest_*.py` | 这些是**程序**不是库，导入即创建沙箱却无人清理 → 每次审计泄漏临时目录 | `audit_static.py` |
+| 含点的文件名被判成"反域名包" | `state.vscdb` 因文件名含点命中 reverse-DNS 规则，被判为**可再生缓存（safe）** → 会删掉 VS Code 状态库 | `core/ownership.py` `_REVERSE_DNS` |
+| 适配器自己的数据根被判成缓存 | `github.copilot-chat` 是 Copilot 适配器的声明根，名字形如包名 → 被判 safe | `core/ownership.py`（exact 根的硬性回退：声明根永远不能是 safe） |
+| 凭据识别按子串匹配 | 一个 704 MB 的 Agent 目录里报出 **150 个"密钥"**——`token.py`、`token-schema.json`、`user-secret.svg`、`git-credential-helper-selector.exe` 全部误报，真密钥被淹没 | `core/ownership.py`（改为：二进制硬排除 → 强名匹配胜过文档扩展名 → 分段+内容双重校验） |
+| `~/.dsh` 整体判 `never` 掩盖内部残留 | 472 MB 浏览器缓存与 `.credentials.yaml` 全部不可见 | `core/ownership.py`（递归下钻：`never` 父目录内仍会列出可操作项） |
+| `.credentials.yaml` 被扩展名排除漏掉 | `.yaml` 在"非凭据扩展名"表里，真密钥文件**漏报** | `core/ownership.py`（强名匹配先于扩展名排除） |
+| 空目录被降级为"需确认" | 空目录不含任何文件，删除不可能丢数据，却被归属置信度降级挡住 | `core/ownership.py`（空壳一律 safe） |
+| 预演被"Agent 正在运行"拦截 | 预演不改任何文件，却要求先退出程序——用户恰恰想在程序运行时先看看会删什么 | `core/cleaner.py`（预演始终放行，真正执行才检查进程） |
+| 数据根目录因"归属不明"无法删除 | 完整卸载时适配器自己的根被判 `never`（分类器不认识该适配器） | `core/cleaner.py`（`allow_roots` 下按适配器自己的声明判定，shared/source_repo 仍拒绝） |
 
 ---
 
@@ -351,7 +409,10 @@ python run_all_tests.py
 - **Agent 版本升级可能改变存储格式**。遇到不认识的格式，适配器会降级为「仅浏览」而不是猜着删；需要时更新对应适配器。
 - **删除前请退出对应的 Agent**。SQLite 类（WorkBuddy、Copilot）在应用运行时会被拒绝操作，因为程序持有数据库并在退出时重写。
 - Antigravity Tools、Copilot 的会话表在当前机器上是空的，相关删除路径已在沙箱中验证，但**尚未在真实数据上跑过**。
-- 「可回收空间」中的安装包残留等**只给建议，不会自动删除**。
+- **`HKLM` 注册表键与防火墙规则需要管理员**。本工具不会尝试提权，而是给出可直接复制的命令。
+- **调用官方卸载器不可撤销**。这是整个流程里唯一真正不可逆的一步，UI 要求勾选确认框，CLI 要求 `--yes`。
+- **重复内容检测与敏感信息扫描只报告，不删除**。处置由用户在审阅后决定。
+- 占用增长趋势需要多次快照才有效：少于 3 个数据点时明确提示数据不足，而不是给出误导性预测。
 
 ---
 

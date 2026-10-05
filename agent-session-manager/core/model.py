@@ -22,6 +22,16 @@ KIND_JSON_INDEX = "json_index_edit"
 KIND_ATTACHMENT = "attachment_gc"
 #: Set a flag instead of deleting rows (agent-specific soft delete).
 KIND_SOFT_DELETE = "sqlite_soft_delete"
+#: Remove a registry key (a .reg export is taken first, for rollback).
+KIND_REGISTRY = "registry_delete"
+#: Remove a firewall rule (its full definition is exported first).
+KIND_FIREWALL = "firewall_delete"
+#: Remove a Start Menu / Desktop shortcut.
+KIND_SHORTCUT = "shortcut_delete"
+#: Actions that are only ever *reported*, never performed automatically:
+#: removing a service or a scheduled task needs elevation and can break the
+#: machine, so the user is told what to run instead.
+KIND_MANUAL = "manual_action"
 
 
 @dataclass

@@ -20,7 +20,21 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core import export as export_mod  # noqa: E402
-from core import inventory, retention, search, store, usage  # noqa: E402
+from core import (  # noqa: E402
+    dupes,
+    history,
+    inventory,
+    projects,
+    quarantine,
+    residue,
+    retention,
+    search,
+    secrets,
+    store,
+    uninstall,
+    usage,
+)
+from core.cleaner import CleanupError  # noqa: E402
 from core.executor import ExecutionError, Executor  # noqa: E402
 from core.util import plat  # noqa: E402
 
@@ -228,6 +242,198 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.error_out("读取失败", 500, str(e))
 
+        # ---- disk ownership & residue --------------------------------------
+        # /api/ownership?depth=3   -- what belongs to whom, and how sure we are
+        if path == "/api/ownership":
+            q = self._query()
+            try:
+                from core.ownership import scan_all
+
+                depth = max(1, min(6, int(q.get("depth") or 3)))
+                return self.json_out({"ok": True, **scan_all(max_depth=depth)})
+            except Exception as e:
+                return self.error_out("归属分析失败", 500, f"{type(e).__name__}: {e}")
+
+        # /api/residue?agent=dsh   -- leftovers, with per-item evidence
+        if path == "/api/residue":
+            q = self._query()
+            agent = q.get("agent", "")
+            try:
+                if agent:
+                    return self.json_out({"ok": True, **residue.scan_agent(agent)})
+                return self.json_out({"ok": True, **residue.scan_all_agents()})
+            except Exception as e:
+                return self.error_out("残留扫描失败", 500, f"{type(e).__name__}: {e}")
+
+        # /api/uninstall/preflight?agent=dsh
+        if path == "/api/uninstall/preflight":
+            q = self._query()
+            agent = q.get("agent", "")
+            if not agent:
+                return self.error_out("缺少 agent 参数")
+            try:
+                return self.json_out({"ok": True, **uninstall.preflight(agent)})
+            except Exception as e:
+                return self.error_out("卸载预检失败", 500, f"{type(e).__name__}: {e}")
+
+        # /api/uninstall/plan?agent=dsh
+        if path == "/api/uninstall/plan":
+            q = self._query()
+            agent = q.get("agent", "")
+            if not agent:
+                return self.error_out("缺少 agent 参数")
+            try:
+                return self.json_out({"ok": True, **uninstall.cleanup_plan(agent)})
+            except Exception as e:
+                return self.error_out("生成清理方案失败", 500, f"{type(e).__name__}: {e}")
+
+        # /api/uninstall/verify?agent=dsh
+        if path == "/api/uninstall/verify":
+            q = self._query()
+            agent = q.get("agent", "")
+            if not agent:
+                return self.error_out("缺少 agent 参数")
+            try:
+                return self.json_out({"ok": True, **uninstall.verify(agent)})
+            except Exception as e:
+                return self.error_out("卸载后验证失败", 500, f"{type(e).__name__}: {e}")
+
+        # /api/uninstall/report?agent=dsh
+        if path == "/api/uninstall/report":
+            q = self._query()
+            agent = q.get("agent", "")
+            if not agent:
+                return self.error_out("缺少 agent 参数")
+            try:
+                return self.json_out({"ok": True, **uninstall.report(agent)})
+            except Exception as e:
+                return self.error_out("生成报告失败", 500, f"{type(e).__name__}: {e}")
+
+        # /api/uninstall/overview   -- every agent, for the overview page
+        if path == "/api/uninstall/overview":
+            try:
+                return self.json_out({"ok": True, **uninstall.full_report()})
+            except Exception as e:
+                return self.error_out("读取卸载概览失败", 500, f"{type(e).__name__}: {e}")
+
+        # ---- quarantine policy ---------------------------------------------
+        if path == "/api/quarantine":
+            try:
+                return self.json_out({"ok": True, **quarantine.stats()})
+            except Exception as e:
+                return self.error_out("读取隔离区失败", 500, str(e))
+
+        # /api/quarantine/plan?mode=expired|over_cap|all
+        if path == "/api/quarantine/plan":
+            q = self._query()
+            try:
+                return self.json_out(
+                    {"ok": True, **quarantine.plan_purge(q.get("mode") or "expired")}
+                )
+            except Exception as e:
+                return self.error_out("计算清理方案失败", 500, str(e))
+
+        if path == "/api/cleanup-operations":
+            try:
+                from core.cleaner import list_cleanup_operations
+
+                return self.json_out(
+                    {"ok": True, "operations": list_cleanup_operations()}
+                )
+            except Exception as e:
+                return self.error_out("读取清理记录失败", 500, str(e))
+
+        # ---- history / trend ------------------------------------------------
+        # /api/history?agent=dsh&days=90
+        if path == "/api/history":
+            q = self._query()
+            try:
+                return self.json_out(
+                    {
+                        "ok": True,
+                        "summary": history.summarize(),
+                        "series": history.series(
+                            q.get("agent", ""), days=int(q.get("days") or 90)
+                        ),
+                        "trend": history.trend(
+                            q.get("agent", ""), days=int(q.get("days") or 30)
+                        ),
+                    }
+                )
+            except Exception as e:
+                return self.error_out("读取增长趋势失败", 500, f"{type(e).__name__}: {e}")
+
+        # ---- projects --------------------------------------------------------
+        if path == "/api/projects":
+            try:
+                sessions = [s.to_dict() for s in inventory.scan()]
+                store.decorate(sessions)
+                scores = {}
+                usage_by = {}
+                for s in sessions:
+                    try:
+                        usage_by[f"{s['agent']}|{s['sid']}"] = usage.for_session(
+                            s["agent"], s["sid"]
+                        )
+                    except Exception:
+                        continue
+                try:
+                    from adapters.registry import get_adapter
+
+                    previews = {}
+                    for s in sessions:
+                        a = get_adapter(s["agent"])
+                        if a is None:
+                            continue
+                        try:
+                            previews[f"{s['agent']}|{s['sid']}"] = a.preview(s["sid"])
+                        except Exception:
+                            continue
+                    scores = retention.score_all(sessions, usage_by, previews)
+                except Exception:
+                    scores = {}
+                return self.json_out(
+                    {"ok": True, **projects.group(sessions, scores, usage_by)}
+                )
+            except Exception as e:
+                return self.error_out("项目聚合失败", 500, f"{type(e).__name__}: {e}")
+
+        # ---- duplicates ------------------------------------------------------
+        # /api/dupes?min_kb=4
+        if path == "/api/dupes":
+            q = self._query()
+            try:
+                min_bytes = max(1024, int(q.get("min_kb") or 4) * 1024)
+                return self.json_out({"ok": True, **dupes.find(min_bytes=min_bytes)})
+            except Exception as e:
+                return self.error_out("重复内容检测失败", 500, f"{type(e).__name__}: {e}")
+
+        # ---- secrets ---------------------------------------------------------
+        # /api/secrets?agent=dsh&sid=...   (one session)
+        if path == "/api/secrets":
+            q = self._query()
+            agent, sid = q.get("agent", ""), q.get("sid", "")
+            try:
+                if agent and sid:
+                    return self.json_out(
+                        {"ok": True, **secrets.scan_session(agent, sid)}
+                    )
+                sessions = [s.to_dict() for s in inventory.scan()]
+                return self.json_out({"ok": True, **secrets.scan_sessions(sessions)})
+            except Exception as e:
+                return self.error_out("敏感信息扫描失败", 500, f"{type(e).__name__}: {e}")
+
+        if path == "/api/secrets/patterns":
+            return self.json_out(
+                {
+                    "ok": True,
+                    "patterns": [
+                        {"id": p["id"], "label": p["label"], "severity": p["severity"]}
+                        for p in secrets.PATTERNS
+                    ],
+                }
+            )
+
         if path == "/api/operations":
             try:
                 return self.json_out({"ok": True, "operations": Executor.list_operations()})
@@ -400,6 +606,163 @@ class Handler(BaseHTTPRequestHandler):
                 return self.error_out(str(e), 400)
             except Exception as e:
                 return self.error_out("导出失败", 500, f"{type(e).__name__}: {e}")
+
+        # ---- residue cleanup -------------------------------------------------
+        # /api/cleanup  { agent, paths?, dispositions?, permanent?, dry_run? }
+        if path == "/api/cleanup":
+            agent = body.get("agent", "")
+            if not agent:
+                return self.error_out("缺少 agent")
+            paths = body.get("paths")
+            if paths is not None and not isinstance(paths, list):
+                return self.error_out("paths 必须是数组")
+            dispositions = body.get("dispositions")
+            if dispositions is not None and not isinstance(dispositions, list):
+                return self.error_out("dispositions 必须是数组")
+            try:
+                r = uninstall.execute_cleanup(
+                    agent,
+                    paths=paths,
+                    dispositions=dispositions,
+                    include_data_roots=bool(body.get("include_data_roots")),
+                    permanent=bool(body.get("permanent")),
+                    dry_run=bool(body.get("dry_run")),
+                    force_while_running=bool(body.get("force")),
+                )
+                return self.json_out({"ok": True, **r})
+            except CleanupError as e:
+                return self.error_out("清理失败", 409, str(e))
+            except Exception as e:
+                return self.error_out("清理异常", 500, f"{type(e).__name__}: {e}")
+
+        # /api/registry-delete  { hive, key, dry_run? }
+        if path == "/api/registry-delete":
+            hive, key = body.get("hive", ""), body.get("reg_key") or body.get("key", "")
+            if not hive or not key:
+                return self.error_out("缺少 hive 或 reg_key")
+            try:
+                from core.cleaner import remove_registry_key
+
+                r = remove_registry_key(hive, key, dry_run=bool(body.get("dry_run")))
+                return self.json_out({"ok": bool(r.get("ok")), **r})
+            except Exception as e:
+                return self.error_out("注册表操作失败", 500, f"{type(e).__name__}: {e}")
+
+        # /api/registry-restore  { op_id }
+        if path == "/api/registry-restore":
+            op_id = body.get("op_id", "")
+            if not op_id:
+                return self.error_out("缺少 op_id")
+            try:
+                from core.cleaner import restore_registry_key
+
+                return self.json_out({"ok": True, **restore_registry_key(op_id)})
+            except CleanupError as e:
+                return self.error_out("还原失败", 409, str(e))
+            except Exception as e:
+                return self.error_out("还原异常", 500, f"{type(e).__name__}: {e}")
+
+        # /api/uninstall/run  { agent }  -- the only irreversible step
+        if path == "/api/uninstall/run":
+            agent = body.get("agent", "")
+            if not agent:
+                return self.error_out("缺少 agent")
+            if not body.get("confirm"):
+                return self.error_out(
+                    "必须显式确认：调用官方卸载器不可撤销，请传入 confirm=true。", 400
+                )
+            try:
+                pf = uninstall.preflight(agent)
+                entry = pf.get("uninstall") or {}
+                from core.cleaner import run_uninstaller
+
+                # Rebuild the registry entry shape the runner needs.
+                r = run_uninstaller(
+                    {
+                        "quiet_uninstall_string": entry.get("command", "")
+                        if entry.get("silent")
+                        else "",
+                        "uninstall_string": entry.get("command", ""),
+                    }
+                )
+                return self.json_out({"ok": bool(r.get("ok")), **r})
+            except Exception as e:
+                return self.error_out("启动卸载器失败", 500, f"{type(e).__name__}: {e}")
+
+        # ---- quarantine ------------------------------------------------------
+        # /api/quarantine/policy  { retention_days?, max_bytes?, grace_hours?, enabled? }
+        if path == "/api/quarantine/policy":
+            try:
+                changes = {
+                    k: body[k]
+                    for k in ("retention_days", "max_bytes", "grace_hours", "enabled")
+                    if k in body
+                }
+                return self.json_out({"ok": True, "policy": quarantine.set_policy(**changes)})
+            except Exception as e:
+                return self.error_out("保存策略失败", 500, str(e))
+
+        # /api/quarantine/purge  { mode?, op_ids? }
+        if path == "/api/quarantine/purge":
+            op_ids = body.get("op_ids")
+            if op_ids is not None and not isinstance(op_ids, list):
+                return self.error_out("op_ids 必须是数组")
+            try:
+                r = quarantine.purge(body.get("mode") or "expired", op_ids=op_ids)
+                return self.json_out({"ok": True, **r})
+            except Exception as e:
+                return self.error_out("清空隔离区失败", 500, str(e))
+
+        # ---- history ---------------------------------------------------------
+        if path == "/api/history/record":
+            try:
+                return self.json_out({"ok": True, **history.record(force=bool(body.get("force")))})
+            except Exception as e:
+                return self.error_out("记录快照失败", 500, f"{type(e).__name__}: {e}")
+
+        # ---- archive then delete (export -> verify -> delete) ----------------
+        # /api/archive-delete  { agent, sid, format?, permanent?, dry_run? }
+        if path == "/api/archive-delete":
+            agent, sid = body.get("agent", ""), body.get("sid", "")
+            if not agent or not sid:
+                return self.error_out("缺少 agent 或 sid")
+            try:
+                fmt = str(body.get("format") or "markdown")
+                if body.get("dry_run"):
+                    return self.json_out(
+                        {
+                            "ok": True,
+                            "dry_run": True,
+                            "note": "预演：将先导出该会话，校验导出文件非空后再删除。",
+                            "agent": agent,
+                            "sid": sid,
+                            "format": fmt,
+                        }
+                    )
+                exp = export_mod.export(agent, sid, fmt)
+                path_out = Path(exp.get("path") or "")
+                size = path_out.stat().st_size if path_out.exists() else 0
+                if size <= 0:
+                    return self.error_out(
+                        "导出校验失败：导出文件为空，已中止删除。", 409,
+                        str(path_out),
+                    )
+                r = Executor().execute(
+                    agent,
+                    sid,
+                    allow_permanent=bool(body.get("permanent")),
+                    allow_unpin=bool(body.get("allow_unpin")),
+                )
+                return self.json_out(
+                    {"ok": True, "export": exp, "export_bytes": size, "delete": r,
+                     "note": "已导出并通过非空校验，随后删除。"}
+                )
+            except ExecutionError as e:
+                return self.error_out("归档后删除失败", 409, str(e))
+            except ValueError as e:
+                return self.error_out(str(e), 400)
+            except Exception as e:
+                return self.error_out("归档后删除异常", 500, f"{type(e).__name__}: {e}")
 
         if path == "/api/restore":
             op_id = body.get("op_id", "")

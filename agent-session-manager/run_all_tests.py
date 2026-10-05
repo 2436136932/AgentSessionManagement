@@ -21,6 +21,7 @@ SUITES = [
     ("会话内容预览 (只读, 逐字节校验)", "selftest_preview.py"),
     ("安全防护: 保留标记 / 指纹校验 / 保留规则", "selftest_safety.py"),
     ("恶意输入防护 (只读, 不删除)", "selftest_hostile.py"),
+    ("残留清理: 归属分级 / never 拒绝 / 预演 / 隔离区策略", "selftest_residue.py"),
     ("删除/还原 - DSH 文件与索引", "selftest_delete.py"),
     ("删除/还原 - SQLite、全文索引与 CodeBuddy 层级", "selftest_sqlite.py"),
     ("真实数据库副本往返 (只读原件)", "selftest_realdb.py"),

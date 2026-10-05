@@ -44,3 +44,4 @@ desktop.ini
 *.bak
 *.tmp
 .tmp-*
+acl-recovery/

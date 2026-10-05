@@ -145,6 +145,7 @@
     <button data-view="search">内容搜索</button>
     <button data-view="usage">用量</button>
     <button data-view="cleanup">清理建议</button>
+    <button data-view="uninstall">卸载清理</button>
     <button data-view="history">操作记录</button>
   </nav>
 </header>
@@ -155,6 +156,7 @@
   <section id="view-search" style="display:none"></section>
   <section id="view-usage" style="display:none"></section>
   <section id="view-cleanup" style="display:none"></section>
+  <section id="view-uninstall" style="display:none"></section>
   <section id="view-history" style="display:none"></section>
 </main>
 
@@ -188,13 +190,14 @@ document.querySelectorAll("nav button").forEach(b => {
     document.querySelectorAll("nav button").forEach(x=>x.classList.remove("active"));
     b.classList.add("active");
     STATE.view = b.dataset.view;
-    ["overview","sessions","search","usage","cleanup","history"].forEach(v => {
+    ["overview","sessions","search","usage","cleanup","uninstall","history"].forEach(v => {
       $("#view-"+v).style.display = (v===STATE.view) ? "" : "none";
     });
     if(STATE.view==="sessions") renderSessions();
     if(STATE.view==="search") renderSearch();
     if(STATE.view==="usage") renderUsage();
     if(STATE.view==="cleanup") renderCleanup();
+    if(STATE.view==="uninstall") renderUninstall();
     if(STATE.view==="history") renderHistory();
   };
 });
@@ -1114,6 +1117,244 @@ window.runRetentionBatch = async () => {
   }
   await loadSessions();
 };
+
+/* ------------------------------------------------- uninstall / clean-up */
+const U = { agent:"", pf:null, plan:null, stage:1 };
+
+window.renderUninstall = async () => {
+  $("#view-uninstall").innerHTML = `<div class="empty"><span class="spin"></span> 正在读取各 Agent 残留…</div>`;
+  let ov;
+  try { ov = await api("/api/uninstall/overview"); }
+  catch(e){ $("#view-uninstall").innerHTML = `<div class="errbox">${esc(e.message)}</div>`; return; }
+  if(!ov.ok){ $("#view-uninstall").innerHTML = `<div class="errbox">${esc(ov.error||"")}</div>`; return; }
+
+  let h = `<h2>卸载与彻底清理</h2>
+    <p style="color:var(--muted);font-size:12.5px;margin:0 0 12px">
+      按 Agent 查看卸载后残留，分级处置（可安全清理 / 需人工确认 / 禁止删除）。
+      每一项都附有判定依据；删除默认进入隔离区，可还原。</p>
+    <div class="card"><table style="width:100%"><thead><tr>
+      <th>Agent</th><th>状态</th><th class="num">可安全回收</th>
+      <th class="num">需人工确认</th><th class="num">禁止删除</th>
+      <th class="num">密钥/凭据</th><th></th></tr></thead><tbody>`;
+  for(const a of (ov.agents||[])){
+    if(a.error){
+      h += `<tr><td>${esc(a.label)}</td><td colspan="5" style="color:var(--warn)">扫描失败：${esc(a.error)}</td>
+            <td></td></tr>`;
+      continue;
+    }
+    h += `<tr>
+      <td><b>${esc(a.label)}</b><div class="sub">${esc(a.agent)}</div></td>
+      <td>${a.installed?'<span class="badge">已安装</span>':'<span class="badge" style="color:var(--muted)">未检测到</span>'}</td>
+      <td class="num" style="color:var(--ok)">${esc(a.reclaimable_bytes_h)}</td>
+      <td class="num" style="color:var(--warn)">${esc(a.review_bytes_h)}</td>
+      <td class="num" style="color:var(--muted)">${esc(a.never_bytes_h)}</td>
+      <td class="num">${a.credentials?`<b style="color:var(--warn)">${a.credentials}</b>`:'0'}</td>
+      <td><button class="act" onclick="openUninstall('${esc(a.agent)}')">查看残留</button></td>
+    </tr>`;
+  }
+  h += `</tbody></table>
+    <div style="padding:10px 12px;color:var(--muted);font-size:12.5px">
+      合计可安全回收：<b style="color:var(--ok)">${esc(ov.total_reclaimable_h)}</b></div>
+    </div>
+    <div id="uDetail"></div>`;
+  $("#view-uninstall").innerHTML = h;
+};
+
+window.openUninstall = async (agent) => {
+  U.agent = agent; U.stage = 1; U.pf = null; U.plan = null;
+  const box = $("#uDetail");
+  box.innerHTML = `<div class="empty"><span class="spin"></span> 正在预检 ${esc(agent)}…</div>`;
+  box.scrollIntoView({behavior:"smooth", block:"start"});
+  let pf;
+  try { pf = await api("/api/uninstall/preflight?agent="+encodeURIComponent(agent)); }
+  catch(e){ box.innerHTML = `<div class="errbox">${esc(e.message)}</div>`; return; }
+  if(!pf.ok){ box.innerHTML = `<div class="errbox">${esc(pf.error||"")}</div>`; return; }
+  U.pf = pf;
+  drawPreflight();
+};
+
+function uStages(){
+  const names = ["预检","调用卸载器","卸载后验证","清理残留","生成报告"];
+  return `<div class="card" style="display:flex;gap:6px;flex-wrap:wrap;padding:8px 12px">` +
+    names.map((n,i) => {
+      const s = i+1;
+      const cur = s===U.stage, done = s<U.stage;
+      return `<span class="badge" style="${cur?'color:var(--fg);font-weight:600':
+        done?'color:var(--ok)':'color:var(--muted)'}">${done?'✓ ':''}${s}. ${n}</span>`;
+    }).join("") + `</div>`;
+}
+
+function drawPreflight(){
+  const pf = U.pf, box = $("#uDetail");
+  const u = pf.uninstall || {};
+  const w = pf.windows || {};
+  const s = (pf.residue&&pf.residue.summary) || {};
+  let h = `<div style="margin:14px 0 8px">${uStages()}</div>
+    <h3>${esc(pf.label)} — 卸载预检</h3>`;
+
+  if((pf.blockers||[]).length){
+    h += pf.blockers.map(b =>
+      `<div class="warnbox"><b>⚠ ${esc(b.title)}</b><br>${esc(b.detail||"")}
+       ${b.action?`<br>→ ${esc(b.action)}`:""}</div>`).join("");
+  } else {
+    h += `<div class="okbox">预检通过，未发现阻碍项。</div>`;
+  }
+
+  h += `<div class="card">
+    <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap">
+      <div><b>官方卸载器</b>
+        <div class="sub">${u.registry_name?esc(u.registry_name)+(u.version?' '+esc(u.version):''):'注册表中未找到卸载条目'}</div></div>
+      <div style="text-align:right"><span class="badge">${u.silent?'支持静默参数':'需图形界面'}</span></div>
+    </div>
+    ${u.command?`<div class="mono" style="margin-top:8px;font-size:12px;word-break:break-all">${esc(u.command)}</div>
+      <div class="sub" style="margin-top:4px">${esc(u.note||"")}</div>`
+      :`<div class="sub" style="margin-top:8px">${esc(u.note||"请从「设置 → 应用」中卸载。")}</div>`}
+    <div class="sub" style="margin-top:8px">
+      会话 ${pf.sessions.count} 个（受保护 ${pf.sessions.pinned} 个） ·
+      可安全回收 ${esc(s.safe_bytes_h||"0 B")} · 需确认 ${esc(s.review_bytes_h||"0 B")}
+      ${w.needs_admin?` · <span style="color:var(--warn)">部分项目需要管理员权限${pf.elevated?'（当前已提权）':'（当前未提权）'}</span>`:""}
+    </div>
+  </div>`;
+
+  if((pf.credentials||[]).length){
+    h += `<div class="warnbox"><b>检测到 ${pf.credentials.length} 个密钥/凭据文件</b>，
+      卸载后仍会留在磁盘上：</div>
+      <div class="card" style="padding:0;overflow:hidden"><table style="width:100%">` +
+      pf.credentials.slice(0,20).map(c =>
+        `<tr><td class="mono" style="font-size:12px">${esc(c.path)}</td>
+         <td class="num">${esc(c.size_h||"")}</td></tr>`).join("") +
+      `</table></div>`;
+  }
+  if((pf.temp||[]).length){
+    h += `<div class="sub" style="margin:8px 0">%TEMP% 临时目录 ${pf.temp.length} 个，共 ${esc((pf.temp||[]).reduce((n,t)=>n+(t.size||0),0)>0?"":"0 B")}</div>`;
+  }
+
+  h += `<div class="row" style="margin-top:12px">
+      <button class="act ghostbtn" onclick="openUninstall('${esc(U.agent)}')">重新预检</button>
+      <button class="act" onclick="gotoVerify()">下一步：卸载后验证</button>
+      <button class="act" onclick="gotoPlan()" ${U.pf.installed?'':'disabled'}>查看清理方案</button>
+    </div>
+    <div id="uNext"></div>`;
+  box.innerHTML = h;
+}
+
+window.gotoVerify = async () => {
+  U.stage = 3;
+  const box = $("#uNext");
+  box.innerHTML = `<div class="empty"><span class="spin"></span> 正在重新扫描…</div>`;
+  let v;
+  try { v = await api("/api/uninstall/verify?agent="+encodeURIComponent(U.agent)); }
+  catch(e){ box.innerHTML = `<div class="errbox">${esc(e.message)}</div>`; return; }
+  if(!v.ok){ box.innerHTML = `<div class="errbox">${esc(v.error||"")}</div>`; return; }
+  box.innerHTML = `<h3>卸载后验证</h3>
+    <div class="${v.remaining_items? 'warnbox':'okbox'}">
+      ${v.remaining_items
+        ? `仍有 <b>${v.remaining_items}</b> 项残留（${esc(v.remaining_bytes_h)}），可继续清理。`
+        : `<b>已清理干净。</b>`}
+      <div class="sub">${esc(v.note||"")}</div>
+    </div>
+    <div class="card"><table style="width:100%">
+      <tr><td>仍然安装</td><td>${v.still_installed?'是':'否'}</td></tr>
+      <tr><td>注册表卸载条目</td><td>${v.uninstall_entry_present?'仍在':'已清除'}</td></tr>
+      <tr><td>仍可回收</td><td class="num">${esc(v.reclaimable_bytes_h)}</td></tr>
+      <tr><td>密钥残留</td><td class="num">${v.credentials_left}</td></tr>
+      <tr><td>需要管理员</td><td>${v.needs_admin?'是':'否'}</td></tr>
+    </table></div>
+    <div class="row" style="margin-top:10px">
+      <button class="act" onclick="gotoPlan()">下一步：清理残留</button>
+      <button class="act ghostbtn" onclick="openUninstall('${esc(U.agent)}')">返回预检</button>
+    </div>`;
+};
+
+window.gotoPlan = async () => {
+  U.stage = 4;
+  const box = $("#uNext");
+  box.innerHTML = `<div class="empty"><span class="spin"></span> 正在分析残留…</div>`;
+  let p;
+  try { p = await api("/api/uninstall/plan?agent="+encodeURIComponent(U.agent)); }
+  catch(e){ box.innerHTML = `<div class="errbox">${esc(e.message)}</div>`; return; }
+  if(!p.ok){ box.innerHTML = `<div class="errbox">${esc(p.error||"")}</div>`; return; }
+  U.plan = p;
+  box.innerHTML = `<h3>清理方案</h3><div class="sub" style="margin:0 0 10px">${esc(p.note||"")}</div>
+    ${uPlanPanel()}`;
+};
+
+function uPlanPanel(){
+  const p = U.plan;
+  const row = (it, checked) => {
+    const kind = it.kind ? `[${esc(it.kind)}] ` : "";
+    const lock = it.needs_admin ? ` <span class="badge" style="color:var(--warn)">需管理员</span>` : "";
+    return `<tr>
+      <td style="width:30px">${it.needs_admin?'<span title="需要管理员权限" style="color:var(--muted)">🔒</span>'
+        :`<input type="checkbox" class="uPick" data-path="${esc(it.path)}" ${checked?"checked":""}>`}</td>
+      <td><div class="mono" style="font-size:12px;word-break:break-all">${kind}${esc(it.path)}</div>
+        <div class="sub">${esc(it.evidence||"")}</div></td>
+      <td class="num">${esc(it.size_h||"—")}</td>
+      <td>${esc(it.category_label||it.category||"")}</td>
+    </tr>`;
+  };
+  const group = (title, items, checked, muted) => items.length ? `
+    <details open><summary><b>${esc(title)}</b> — ${items.length} 项
+      <span style="color:var(--muted);font-size:12px">
+        ${muted?'（列出原因，不会删除）':'（勾选后清理）'}</span></summary>
+      <div class="card" style="padding:0;overflow:hidden;max-height:340px;overflow-y:auto">
+      <table style="width:100%">${items.map(i=>row(i,checked)).join("")}</table></div>
+    </details>` : "";
+  return group("可安全清理", p.safe, true, false)
+       + group("需人工确认", p.review, false, false)
+       + group("禁止删除", p.never, false, true)
+    + `<div class="row" style="margin-top:12px;align-items:center">
+        <button class="act ghostbtn" onclick="runCleanup(true)">预演</button>
+        <button class="act" onclick="runCleanup(false)">清理选中项</button>
+        <label class="chk"><input type="checkbox" id="uPerm">
+          永久删除（不进隔离区，无法还原）</label>
+        <label class="chk"><input type="checkbox" id="uRoots">
+          包含数据根目录（不可逆，需谨慎）</label>
+      </div>
+      <div id="uRun"></div>`;
+}
+
+window.runCleanup = async (dry) => {
+  const picks = [...document.querySelectorAll(".uPick:checked")].map(c=>c.dataset.path);
+  const box = $("#uRun");
+  if(!picks.length){ box.innerHTML = `<div class="warnbox">没有勾选任何项目。</div>`; return; }
+  if(!dry && !confirm(`将清理 ${picks.length} 项（默认进入隔离区，可还原）。继续？`)) return;
+  box.innerHTML = `<div class="empty"><span class="spin"></span> ${dry?"预演中…":"正在清理…"}</div>`;
+  const perm = $("#uPerm") && $("#uPerm").checked;
+  const roots = $("#uRoots") && $("#uRoots").checked;
+  let r;
+  try {
+    r = await api("/api/cleanup", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({agent:U.agent, paths:picks, dry_run:!!dry,
+                            permanent:perm && !dry, include_data_roots:roots})});
+  } catch(e){ box.innerHTML = `<div class="errbox">${esc(e.message)}</div>`; return; }
+  if(!r.ok){ box.innerHTML = `<div class="errbox">${esc(r.error||"")}${r.detail?`<br>${esc(r.detail)}`:""}</div>`; return; }
+
+  const fo = r.file_ops || {};
+  if(dry){
+    box.innerHTML = `<div class="okbox"><b>预演完成，未修改任何文件。</b>
+      <div class="sub">${esc(r.note||"")}</div></div>` + uResultList(fo);
+    return;
+  }
+  box.innerHTML = `<div class="${r.files&&r.files.removed?'okbox':'warnbox'}">
+      ${esc(r.note||"")}</div>` + uResultList(fo)
+    + (r.needs_admin&&r.needs_admin.length ? `<div class="warnbox"><b>以下项目需要管理员权限，请自行执行：</b><br>`
+      + r.needs_admin.map(c=>`<span class="mono" style="font-size:12px">${esc(c.command)}</span>`).join("<br>") + `</div>` : "")
+    + `<div class="row" style="margin-top:10px">
+        <button class="act" onclick="gotoVerify()">重新验证残留</button></div>`;
+};
+
+function uResultList(fo){
+  const res = fo.results || [];
+  if(!res.length) return "";
+  return `<div class="card" style="padding:0;overflow:hidden;max-height:320px;overflow-y:auto">
+    <table style="width:100%">` + res.map(x =>
+      `<tr><td style="width:24px">${x.ok?'<span style="color:var(--ok)">✓</span>':
+        `<span style="color:var(--danger)">✗</span>`}</td>
+       <td class="mono" style="font-size:12px;word-break:break-all">${esc(x.path)}</td>
+       <td style="color:var(--muted);font-size:12px">${x.ok?'':esc(x.error||"")}</td></tr>`).join("")
+    + `</table></div>`;
+}
 
 /* -------------------------------------------------------------- history */
 async function renderHistory(){
