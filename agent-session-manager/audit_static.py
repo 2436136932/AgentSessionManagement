@@ -160,6 +160,61 @@ def unused_imports(path: Path) -> list[tuple[int, str]]:
     return out
 
 
+def ui_checks() -> None:
+    """Invariants in the single-file UI that a Python test cannot express.
+
+    The sessions view is rebuilt wholesale with `innerHTML` on every render,
+    including an asynchronous one when the value scores finish loading. Any
+    control state stored in the DOM is therefore destroyed the moment the view
+    re-renders. That is not hypothetical: it silently broke
+      * the overview cards' "查看会话", which set the <select> and then
+        immediately re-rendered over it, and
+      * a half-typed search box, cleared when the scores arrived.
+    The fix is that filter state lives in STATE.sessionFilter and is applied at
+    render time. These checks keep it that way.
+    """
+    print("\n[4] UI state-persistence invariants")
+    ui = ROOT / "web" / "index.html"
+    try:
+        src = ui.read_text(encoding="utf-8")
+    except OSError as e:
+        FAILURES.append(f"web/index.html unreadable: {e}")
+        print(f"  [FAIL] cannot read web/index.html: {e}")
+        return
+
+    # A mojibake'd UI is the failure mode that once cost a full rewrite.
+    if "\ufffd" in src:
+        FAILURES.append("web/index.html contains U+FFFD replacement chars")
+        print("  [FAIL] web/index.html 含替换字符（编码已损坏）")
+    else:
+        print("  [PASS] web/index.html 为合法 UTF-8，无替换字符")
+
+    checks = [
+        ("筛选状态保存在 STATE.sessionFilter",
+         "sessionFilter: {" in src),
+        ("showSessionsFor 不直接写 DOM（避免被随后的重渲染抹掉）",
+         'STATE.sessionFilter.agent = agent' in src
+         and '$("#agentFilter").value = agent' not in src),
+        ("Agent 下拉在渲染时回填选中项",
+         "a===F.agent" in src),
+        ("排序下拉在渲染时回填选中项",
+         "F.sort===" in src),
+        ("搜索框在渲染时回填内容",
+         'id="q" placeholder="搜索标题、路径、会话 ID…" value="${esc(F.q)}"' in src),
+        ("只看残留复选框在渲染时回填",
+         'id="onlyResidue"${F.onlyRes?" checked":""}' in src),
+        ("apply() 把控件值写回持久状态",
+         "STATE.sessionFilter.q = " in src
+         and "STATE.sessionFilter.onlyRes = onlyRes" in src),
+    ]
+    for label, ok in checks:
+        if ok:
+            print(f"  [PASS] {label}")
+        else:
+            FAILURES.append("UI: " + label)
+            print(f"  [FAIL] {label}")
+
+
 def main() -> int:
     print("=" * 74)
     print("STATIC AUDIT")
@@ -214,6 +269,8 @@ def main() -> int:
                 print(f"  [FAIL] {rel}:{ln}: unused import {n!r}")
     if not total:
         print(f"  [PASS] no unused imports across {len(files)} files")
+
+    ui_checks()
 
     print("\n" + "=" * 74)
     if FAILURES:

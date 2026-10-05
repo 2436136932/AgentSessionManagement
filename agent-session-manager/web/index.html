@@ -192,7 +192,12 @@ function closeModal(){ $("#modal").classList.remove("show"); }
 $("#modal").addEventListener("click", e => { if(e.target.id==="modal") closeModal(); });
 document.addEventListener("keydown", e => { if(e.key==="Escape") closeModal(); });
 
-let STATE = { report:null, sessions:[], scores:null, view:"overview" };
+let STATE = { report:null, sessions:[], scores:null, view:"overview",
+  // Filter state for the sessions table. It lives here rather than in the DOM
+  // because this view is rebuilt wholesale with innerHTML on every render
+  // (including when the value scores finish loading asynchronously), which
+  // would otherwise reset the agent filter and wipe a half-typed search.
+  sessionFilter: { q:"", agent:"", sort:"size", onlyRes:false } };
 
 /* ------------------------------------------------------------------ views */
 document.querySelectorAll("nav button").forEach(b => {
@@ -270,10 +275,13 @@ async function loadOverview(){
 }
 
 window.showSessionsFor = (agent) => {
+  // Remember the choice *before* switching: renderSessions() rebuilds this view
+  // by assigning innerHTML, so a value set on the old <select> is discarded the
+  // moment the new markup is built. Filter state therefore lives outside the
+  // DOM and is re-applied on every render.
+  STATE.sessionFilter.agent = agent || "";
+  STATE.sessionFilter.q = "";
   document.querySelector('nav button[data-view="sessions"]').click();
-  const af = $("#agentFilter");
-  if(af) af.value = agent;
-  renderSessions();
 };
 
 /* --------------------------------------------------------------- sessions */
@@ -303,21 +311,22 @@ async function renderSessions(){
     }
   }
   const agents = [...new Set(STATE.sessions.map(s=>s.agent))].sort();
+  const F = STATE.sessionFilter;
 
   $("#view-sessions").innerHTML = `
     <div class="toolbar">
-      <input type="search" id="q" placeholder="搜索标题、路径、会话 ID…">
+      <input type="search" id="q" placeholder="搜索标题、路径、会话 ID…" value="${esc(F.q)}">
       <select id="agentFilter">
         <option value="">全部 Agent</option>
-        ${agents.map(a=>`<option value="${esc(a)}">${esc(a)}</option>`).join("")}
+        ${agents.map(a=>`<option value="${esc(a)}"${a===F.agent?" selected":""}>${esc(a)}</option>`).join("")}
       </select>
       <select id="sortBy">
-        <option value="size">按体积排序</option>
-        <option value="time">按时间排序</option>
-        <option value="title">按标题排序</option>
-        <option value="score">按价值排序</option>
+        <option value="size"${F.sort==="size"?" selected":""}>按体积排序</option>
+        <option value="time"${F.sort==="time"?" selected":""}>按时间排序</option>
+        <option value="title"${F.sort==="title"?" selected":""}>按标题排序</option>
+        <option value="score"${F.sort==="score"?" selected":""}>按价值排序</option>
       </select>
-      <label class="chk"><input type="checkbox" id="onlyResidue"> 只看残留（幽灵/孤儿）</label>
+      <label class="chk"><input type="checkbox" id="onlyResidue"${F.onlyRes?" checked":""}> 只看残留（幽灵/孤儿）</label>
       <span class="badge" id="cnt"></span>
       <button class="act ghostbtn" onclick="refreshAll()">重新扫描</button>
     </div>
@@ -343,6 +352,13 @@ async function renderSessions(){
     const af = $("#agentFilter").value;
     const onlyRes = $("#onlyResidue").checked;
     const sort = $("#sortBy").value;
+    // Mirror the controls into the persisted filter state, so an asynchronous
+    // re-render (the value scores arrive after the table is first painted)
+    // does not silently throw away what the user typed or selected.
+    STATE.sessionFilter.q = $("#q").value;
+    STATE.sessionFilter.agent = af;
+    STATE.sessionFilter.sort = sort;
+    STATE.sessionFilter.onlyRes = onlyRes;
     let list = STATE.sessions.filter(s=>{
       if(af && s.agent!==af) return false;
       if(onlyRes && !(s.is_ghost||s.is_orphan)) return false;
@@ -358,9 +374,11 @@ async function renderSessions(){
       if(sort==="score") return ((a.score&&a.score.score)||0)-((b.score&&b.score.score)||0);
       return String(a.title).localeCompare(String(b.title));
     });
-    $("#cnt").textContent = `${list.length} 个会话 · ${hsize(list.reduce((n,s)=>n+(s.size||0),0))}`;
+    const scope = af ? `（仅 ${af}）` : "";
+    $("#cnt").textContent = `${list.length} 个会话 · ${hsize(list.reduce((n,s)=>n+(s.size||0),0))}${scope}`;
     $("#rows").innerHTML = list.length ? list.map(rowHtml).join("")
-      : `<tr><td colspan="8" class="empty">没有匹配的会话</td></tr>`;
+      : `<tr><td colspan="8" class="empty">没有匹配的会话${
+          af?`（当前仅显示 ${esc(af)}，可把上方筛选改为「全部 Agent」）`:""}</td></tr>`;
   };
 
   ["#q","#agentFilter","#sortBy","#onlyResidue"].forEach(sel=>{
