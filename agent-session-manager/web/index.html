@@ -40,8 +40,7 @@
   table{width:100%;border-collapse:collapse;font-size:13px}
   th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);
     vertical-align:middle}
-  th{color:var(--muted);font-weight:500;font-size:12px;position:sticky;top:57px;
-    background:var(--panel);z-index:10}
+  th{color:var(--muted);font-weight:500;font-size:12px}
   tbody tr:hover{background:var(--panel2)}
   td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
   .mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
@@ -393,23 +392,24 @@ function rowHtml(s){
   const lockLabel = s.pinned ? '取消保留'
                   : s.workspace_protected ? '取消工作区保留'
                   : '保留';
+  const ea = esc(a), eid = esc(id);
   return `<tr>
-    <td><input type="checkbox" class="pick" data-agent="${a}" data-sid="${id}"></td>
+    <td><input type="checkbox" class="pick" data-agent="${ea}" data-sid="${eid}"></td>
     <td class="mono">${esc(s.agent)}</td>
     <td><div class="title clickable" title="点击预览会话内容：${esc(s.title)}"
-          onclick="previewSession('${a}','${id}')">${esc(s.title)}</div>
+          onclick="previewSession('${ea}','${eid}')">${esc(s.title)}</div>
         ${tags.join("")}${s.note?`<div class="path" style="margin:2px 0 0">${esc(s.note)}</div>`:''}</td>
     <td class="mono" style="font-size:11px">${esc(s.sid)}</td>
     <td class="num">${tierCell(s)}</td>
     <td class="num">${hsize(s.size)}</td>
     <td class="mono" style="font-size:11.5px">${esc(s.updated_iso||'')}</td>
     <td style="white-space:nowrap">
-      <button class="act ghostbtn" onclick="previewSession('${a}','${id}')">查看</button>
+      <button class="act ghostbtn" onclick="previewSession('${ea}','${eid}')">查看</button>
       <button class="act ghostbtn" title="${esc(lockTitle)}"
-        onclick="togglePin('${a}','${id}')">${esc(lockLabel)}</button>
+        onclick="togglePin('${ea}','${eid}')">${esc(lockLabel)}</button>
       <button class="act ghostbtn" title="导出会话内容到文件"
-        onclick="exportSession('${a}','${id}')">导出</button>
-      <button class="act" onclick="planDelete('${a}','${id}')">删除…</button>
+        onclick="exportSession('${ea}','${eid}')">导出</button>
+      <button class="act" onclick="planDelete('${ea}','${eid}')">删除…</button>
     </td>
   </tr>`;
 }
@@ -664,10 +664,25 @@ window.planDelete = async (agent, sid) => {
   h += `<div class="row">
     <button class="act ghostbtn" onclick="closeModal()">取消</button>
     <button class="act" id="confirmBtn" ${blocked?'disabled':''}
-      onclick="doDelete('${esc(p.agent)}','${esc(p.sid)}',${JSON.stringify(p.fingerprint||'')})">确认删除</button>
+      onclick="doDeleteFromModal()">确认删除</button>
   </div>`;
 
+  // The fingerprint is carried in a hidden input rather than interpolated into
+  // the onclick attribute: a 64-char hex string is quoted JSON, and embedding it
+  // in a double-quoted HTML attribute breaks the attribute boundary — which made
+  // the confirm button silently do nothing.
+  h += `<input type="hidden" id="fpAgent" value="${esc(p.agent)}">
+        <input type="hidden" id="fpSid" value="${esc(p.sid)}">
+        <input type="hidden" id="fpInput" value="${esc(p.fingerprint||'')}">`;
+
   modal(h);
+};
+
+window.doDeleteFromModal = () => {
+  const agent = $("#fpAgent")?.value || "";
+  const sid = $("#fpSid")?.value || "";
+  const fp = $("#fpInput")?.value || "";
+  return doDelete(agent, sid, fp);
 };
 
 window.doDelete = async (agent, sid, fingerprint) => {
@@ -701,7 +716,7 @@ window.doDelete = async (agent, sid, fingerprint) => {
       <div class="okbox">${esc(r.verify_message||'')}</div>
       <div style="font-size:12.5px;color:var(--muted);margin:10px 0">
         操作编号 <code>${esc(r.op_id)}</code><br>
-        已移动 ${r.staged_count} 项到隔离区${r.permanent?'（已永久删除）':'，可在「操作记录」中还原'}。</div>
+        已移动 ${r.staged_count ?? 0} 项到隔离区${r.permanent?'（已永久删除）':'，可在「操作记录」中还原'}。</div>
       <div class="actions-list">${(r.steps||[]).map(s=>
         `<div><span class="k">${esc(s.action||'')}</span><span>${esc(s.path||s.table||'')}
         ${s.result?` · ${esc(s.result)}`:''}${s.deleted!=null?` · ${s.deleted} 行`:''}</span></div>`).join('')}</div>
